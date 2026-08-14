@@ -19,8 +19,9 @@ Safety-rule build plan: `../docs/architecture-research/11-safety-core-build-plan
 | `core/events.py` — append-only SQLite audit log; gapless replay | ✅ built + tested |
 | `core/engine/` — **the mission state machine + executor**: evidence-gated steps, abort that preempts, deterministic failsafe recovery, portable waypoint-ring orbit, idempotent retries | ✅ built + tested |
 | `backends/fake/` — deterministic practice drone with full fault scripting | ✅ built + tested |
-| **⇒ M1 IS FUNCTIONALLY COMPLETE: an approved plan flies end-to-end on the fake drone** (134 tests) | ✅ |
-| Next: LLM planner (M2) → PX4 SITL backend (M2–M3) → dashboard (M4) | ⏳ |
+| **⇒ M1 FUNCTIONALLY COMPLETE: an approved plan flies end-to-end on the fake drone** | ✅ |
+| `planner/` — **the language layer**: PydanticAI structured output (model authors steps+summary ONLY — envelope is server-injected), bounded validator-feedback repair loop (≤2), full transcript audit; provider-neutral; `python -m planner.demo` for live runs | ✅ built + tested (140 tests) |
+| Next: PX4 SITL backend (M2–M3) → dashboard + approval UI (M4) | ⏳ |
 | `backends/` (Fake → PX4/MAVSDK → Olympe), `planner/`, `server/`, `ui/` | ⏳ upcoming milestones |
 
 ## Run the tests
@@ -32,7 +33,7 @@ pip install -e ".[dev]"                               # or: uv pip install -e ".
 pytest -q
 ```
 
-Expected: `134 passed`. (A handful of python-statemachine `current_state` deprecation
+Expected: `140 passed`. (A handful of python-statemachine `current_state` deprecation
 warnings are known-cosmetic.) The fun ones are the evil suites across `tests/test_rules_wave*.py` —
 sixteen deliberately dangerous missions and states ("skip landing", "neighbor's yard", "orbit the whole
 block", "bow-tie boundary", "dead battery launch", "yesterday's data", "everything wrong at once"...),
