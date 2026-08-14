@@ -1,0 +1,41 @@
+[project]
+name = "drone-mission"
+version = "0.1.0"
+description = "Governed natural-language real-estate photography drone: typed missions, deterministic validation, human approval, simulator-first execution."
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.7",
+    "shapely>=2.0",
+    "pymap3d>=3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=1.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["core*", "backends*", "planner*", "server*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "ASYNC", "PERF", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+plugins = ["pydantic.mypy"]

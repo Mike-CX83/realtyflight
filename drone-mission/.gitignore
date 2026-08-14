@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+.env
+.env.*
+media/
+*.ulg
+*.rrd
+.DS_Store
+Icon?
