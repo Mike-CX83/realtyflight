@@ -20,8 +20,10 @@ Safety-rule build plan: `../docs/architecture-research/11-safety-core-build-plan
 | `core/engine/` — **the mission state machine + executor**: evidence-gated steps, abort that preempts, deterministic failsafe recovery, portable waypoint-ring orbit, idempotent retries | ✅ built + tested |
 | `backends/fake/` — deterministic practice drone with full fault scripting | ✅ built + tested |
 | **⇒ M1 FUNCTIONALLY COMPLETE: an approved plan flies end-to-end on the fake drone** | ✅ |
-| `planner/` — **the language layer**: PydanticAI structured output (model authors steps+summary ONLY — envelope is server-injected), bounded validator-feedback repair loop (≤2), full transcript audit; provider-neutral; `python -m planner.demo` for live runs | ✅ built + tested (140 tests) |
-| Next: PX4 SITL backend (M2–M3) → dashboard + approval UI (M4) | ⏳ |
+| `planner/` — **the language layer**: PydanticAI structured output (model authors steps+summary ONLY — envelope is server-injected), bounded validator-feedback repair loop (≤2), full transcript audit; provider-neutral; `python -m planner.demo` for live runs (verified vs gpt-5.1: first-try pass) | ✅ built + tested |
+| `backends/px4_mavsdk/` — **the PX4 adapter** (MAVSDK): evidence-waited motion, AMSL conversion, defensive gimbal, synthetic/RTSP capture with telemetry sidecars, real idempotency; `python -m backends.px4_mavsdk.smoke` vs a live SITL | ✅ built (SITL run pending Docker) |
+| `tests/test_backend_contract.py` — ONE suite, every backend: fake in CI; `RUN_PX4_CONTRACT=1` + Docker SITL runs the same tests on PX4 — **this file is the portability claim** (146 tests + 6 SITL-gated) | ✅ |
+| Next: fly the full LLM-planned mission on SITL (M3 demo) → dashboard + approval UI (M4) | ⏳ |
 | `backends/` (Fake → PX4/MAVSDK → Olympe), `planner/`, `server/`, `ui/` | ⏳ upcoming milestones |
 
 ## Run the tests
@@ -33,7 +35,9 @@ pip install -e ".[dev]"                               # or: uv pip install -e ".
 pytest -q
 ```
 
-Expected: `140 passed`. (A handful of python-statemachine `current_state` deprecation
+Expected: `146 passed, 6 skipped` (the skips are PX4 contract tests awaiting a live SITL —
+start `docker run --rm -it jonasvautherin/px4-gazebo-headless:1.17.0` and run
+`RUN_PX4_CONTRACT=1 pytest tests/test_backend_contract.py -q` to un-skip them). (A handful of python-statemachine `current_state` deprecation
 warnings are known-cosmetic.) The fun ones are the evil suites across `tests/test_rules_wave*.py` —
 sixteen deliberately dangerous missions and states ("skip landing", "neighbor's yard", "orbit the whole
 block", "bow-tie boundary", "dead battery launch", "yesterday's data", "everything wrong at once"...),

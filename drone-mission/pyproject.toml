@@ -9,6 +9,7 @@ dependencies = [
     "pymap3d>=3.0",
     "python-statemachine>=3.0",
     "pydantic-ai-slim>=2.0",  # add provider extras at runtime, e.g. pydantic-ai-slim[anthropic]
+    "mavsdk>=3.0",            # PX4 backend (bundles mavsdk_server incl. macOS arm64)
 ]
 
 [project.optional-dependencies]
@@ -17,6 +18,9 @@ dev = [
     "pytest-asyncio>=1.0",
     "ruff>=0.5",
     "mypy>=1.10",
+]
+camera = [
+    "opencv-python>=4.9",  # only needed for PX4Backend camera_mode="rtsp"
 ]
 
 [build-system]
