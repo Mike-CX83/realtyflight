@@ -249,6 +249,58 @@ async def test_exhausted_retries_fail_safely(good_plan: MissionPlan):
     assert backend.in_air is False  # still recovered
 
 
+async def test_retried_land_reenters_landing_without_illegal_transition(good_plan: MissionPlan):
+    """Regression pin for the D7 live-flight crash (fixed in 7ff33f0).
+
+    _perform() used to call machine.begin_landing() unconditionally, but
+    _dispatch_with_retries re-invokes _perform() on a transient CommandTimeout —
+    and landing->landing is not a legal transition. Real PX4 missed the
+    touchdown tolerance on the first evidence check and the retry crashed the
+    mission mid-air with TransitionNotAllowed; the deterministic fake always
+    lands cleanly, so the whole suite stayed green around the bug. This scripts
+    that PX4 behavior: first land attempt times out, the retry must complete —
+    and 'landing' must be entered exactly once."""
+    mk, backend, log, clock = build(good_plan)
+    land_idx = len(good_plan.steps) - 1
+    backend.hooks[("land", 0)] = CommandTimeout("no touchdown evidence yet (PX4-style)")
+    ex = await mk()
+    result = await ex.run()
+
+    assert result.outcome == MissionOutcome.COMPLETED
+    assert result.final_state == "completed"
+    events = log.replay(good_plan.mission_id)
+    dispatches = [e for e in events
+                  if e.type == "step.dispatched" and e.payload["step"] == land_idx]
+    assert len(dispatches) == 2  # attempt 0 timed out, attempt 1 landed
+    assert any(e.type == "step.timeout" and e.payload["step"] == land_idx for e in events)
+    entered_landing = [e for e in events
+                       if e.type == "state.transition" and e.payload["target"] == "landing"]
+    assert len(entered_landing) == 1  # the guard skipped, it did not re-transition
+
+
+async def test_retried_return_home_reenters_returning_without_illegal_transition(
+    good_plan: MissionPlan,
+):
+    """Same latent bug, other branch: begin_return() on a retried return_home
+    (returning->returning is equally illegal). Scripted the same way."""
+    mk, backend, log, clock = build(good_plan)
+    rth_idx = len(good_plan.steps) - 2
+    backend.hooks[("return_home", 0)] = CommandTimeout("transient RTL stall")
+    ex = await mk()
+    result = await ex.run()
+
+    assert result.outcome == MissionOutcome.COMPLETED
+    events = log.replay(good_plan.mission_id)
+    dispatches = [e for e in events
+                  if e.type == "step.dispatched" and e.payload["step"] == rth_idx]
+    assert len(dispatches) == 2
+    entered_returning = [e for e in events
+                         if e.type == "state.transition" and e.payload["target"] == "returning"]
+    assert len(entered_returning) == 1
+    # and the flight still finished properly after the wobble
+    assert backend.in_air is False and result.final_state == "completed"
+
+
 async def test_backend_rejection_goes_failsafe(good_plan: MissionPlan):
     mk, backend, log, clock = build(good_plan)
     backend.hooks[("set_gimbal", 0)] = CommandRejected("gimbal stuck")
