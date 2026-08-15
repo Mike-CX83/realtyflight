@@ -424,7 +424,12 @@ class MissionExecutor:
 
     async def _recovery_flight(self) -> None:
         """RTH + land, bypassing plan gates (this IS the safety response) but
-        never the breaker-as-kill-switch for dispatch of NEW work."""
+        never the breaker-as-kill-switch for dispatch of NEW work.
+
+        Never raises: this is the last line of defense, so even if the
+        recovery commands themselves fail (backend timeout/rejection), the
+        mission must still end in a recorded terminal state — not crash the
+        process and lose the outcome."""
         m = self.machine
         tel = await self.backend.latest_telemetry()
         if tel is None or not tel.in_air:
@@ -432,12 +437,15 @@ class MissionExecutor:
             if m.current_state.id == "aborting":
                 m.begin_landing()
             return
-        self.rec.record("failsafe.dispatch", command="return_home")
-        m.begin_return()
-        await self.backend.return_home(idem=f"{self.plan.mission_id}:recovery:rth")
-        self.rec.record("failsafe.dispatch", command="land")
-        m.begin_landing()
-        await self.backend.land(idem=f"{self.plan.mission_id}:recovery:land")
+        try:
+            self.rec.record("failsafe.dispatch", command="return_home")
+            m.begin_return()
+            await self.backend.return_home(idem=f"{self.plan.mission_id}:recovery:rth")
+            self.rec.record("failsafe.dispatch", command="land")
+            m.begin_landing()
+            await self.backend.land(idem=f"{self.plan.mission_id}:recovery:land")
+        except BackendError as exc:
+            self.rec.record("recovery.failed", error=f"{type(exc).__name__}: {exc}")
 
     # ------------------------------------------------------------ misc utils
 

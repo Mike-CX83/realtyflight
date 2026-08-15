@@ -310,6 +310,32 @@ async def test_backend_rejection_goes_failsafe(good_plan: MissionPlan):
     assert "gimbal stuck" in result.reason
 
 
+async def test_recovery_flight_backend_error_ends_failed_not_crashed(good_plan: MissionPlan):
+    """Regression pin for the D8 live-flight crash (fixed alongside D8).
+
+    _recovery_flight() used to call backend.return_home()/land() with no
+    exception handling — the last line of defense could itself raise and
+    crash the whole process uncaught, losing the MissionResult entirely. Real
+    PX4 under heavy load hit exactly this: a mid-flight gate denial triggered
+    failsafe, and the recovery's own return_home() then timed out for the
+    full 120 s ceiling and crashed. Scripts a failure the recovery's return
+    trip itself, on top of a failure that triggers the recovery, and asserts
+    the mission still ends FAILED with a recorded reason — never an escaped
+    exception."""
+    mk, backend, log, clock = build(good_plan)
+    backend.hooks[("set_gimbal", 0)] = CommandRejected("gimbal stuck")  # triggers failsafe
+    backend.hooks[("return_home", 0)] = CommandTimeout("recovery RTL stall (PX4-style)")
+    ex = await mk()
+    result = await ex.run()  # must not raise
+
+    assert result.outcome == MissionOutcome.FAILED
+    assert "gimbal stuck" in result.reason
+    events = log.replay(good_plan.mission_id)
+    assert any(e.type == "recovery.failed" for e in events)
+    final_transition = [e for e in events if e.type == "state.transition"][-1]
+    assert final_transition.payload["target"] == "failed"
+
+
 # ---------------------------------------------------------------------------- #
 # Replay: the log alone tells the whole story
 # ---------------------------------------------------------------------------- #

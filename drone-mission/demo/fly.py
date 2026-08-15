@@ -3,6 +3,11 @@
     # the real thing (SITL running, API key in drone-mission/.env or exported):
     python -m demo.fly "Photograph this property: full exterior package." --backend px4
 
+    # with REAL Gazebo camera frames (D8) — start the sim with the camera vehicle:
+    #   docker run --rm -it -p 8554:8554 \
+    #     jonasvautherin/px4-gazebo-headless:1.17.0 -v gz_x500_mono_cam
+    python -m demo.fly "Photograph this property." --backend px4 --camera rtsp
+
     # keyless dry run (no API, no simulator, deterministic scripted 'LLM'):
     python -m demo.fly --backend fake --model scripted --auto-approve
 
@@ -135,7 +140,13 @@ def scripted_model(prop: Property):
 # --------------------------------------------------------------------------- #
 
 
-async def make_backend(kind: str, time_scale: float, connect_timeout_s: float):
+async def make_backend(
+    kind: str,
+    time_scale: float,
+    connect_timeout_s: float,
+    camera: str = "synthetic",
+    rtsp_url: str | None = None,
+):
     if kind == "fake":
         backend = FakeBackend(clock=time.time, config=FakeConfig(time_scale=time_scale))
         await backend.connect()
@@ -143,14 +154,23 @@ async def make_backend(kind: str, time_scale: float, connect_timeout_s: float):
 
     from backends.px4_mavsdk import PX4Backend, PX4Config
 
-    backend = PX4Backend(clock=time.time, config=PX4Config())
+    cfg_kwargs: dict = {"camera_mode": camera}
+    if rtsp_url:
+        cfg_kwargs["rtsp_url"] = rtsp_url
+    backend = PX4Backend(clock=time.time, config=PX4Config(**cfg_kwargs))
     print(f"connecting to PX4 SITL ({backend.cfg.system_address})...")
     try:
         await asyncio.wait_for(backend.connect(), timeout=connect_timeout_s)
     except TimeoutError:
+        sim_cmd = (
+            "docker run --rm -it -p 8554:8554 "
+            "jonasvautherin/px4-gazebo-headless:1.17.0 -v gz_x500_mono_cam"
+            if camera == "rtsp"
+            else "docker run --rm -it jonasvautherin/px4-gazebo-headless:1.17.0"
+        )
         raise SystemExit(
             "\nCould not reach PX4 SITL. Start the simulator first:\n"
-            "  docker run --rm -it jonasvautherin/px4-gazebo-headless:1.17.0\n"
+            f"  {sim_cmd}\n"
             "then re-run this demo. (exit 5)"
         ) from None
     return backend
@@ -243,6 +263,11 @@ async def main() -> int:
     ap.add_argument("--operator", default=None, help="name recorded on the approval")
     ap.add_argument("--db", default="runs/mission_events.sqlite3",
                     help="event-log SQLite path (audit trail)")
+    ap.add_argument("--camera", choices=["synthetic", "rtsp"], default="synthetic",
+                    help="px4 backend only: 'rtsp' grabs REAL Gazebo camera frames "
+                         "(sim must run gz_x500_mono_cam with -p 8554:8554)")
+    ap.add_argument("--rtsp-url", default=None,
+                    help="override the RTSP stream URL (default: PX4Config's)")
     ap.add_argument("--time-scale", type=float, default=0.05,
                     help="fake backend only: motion time scale (0 = instant)")
     ap.add_argument("--tick", type=float, default=2.0, help="telemetry printout period, seconds")
@@ -253,11 +278,15 @@ async def main() -> int:
     operator = args.operator or os.environ.get("USER") or getpass.getuser() or "operator"
 
     # ---- 0. the aircraft ---------------------------------------------------- #
-    backend = await make_backend(args.backend, args.time_scale, args.connect_timeout)
+    backend = await make_backend(
+        args.backend, args.time_scale, args.connect_timeout,
+        camera=args.camera, rtsp_url=args.rtsp_url,
+    )
     tel = await first_telemetry(backend)
     prop = property_around(tel.position)
+    camera_note = f"   camera: {args.camera}" if args.backend == "px4" else ""
     print(f"backend: {backend.name}   home: ({tel.position.lat:.6f},{tel.position.lon:.6f})   "
-          f"battery: {tel.battery_pct:.0f}%")
+          f"battery: {tel.battery_pct:.0f}%{camera_note}")
 
     # ---- 1. natural language -> validated plan (planner + static rules) ----- #
     model = pick_model(args.model)

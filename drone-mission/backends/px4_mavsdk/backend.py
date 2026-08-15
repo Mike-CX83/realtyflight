@@ -126,6 +126,14 @@ class PX4Backend:
         for task in self._tasks:
             task.cancel()
         self._tasks = []
+        if self._system is not None:
+            # mavsdk spawns a bundled mavsdk_server subprocess per System() that
+            # outlives the process if never told to stop (leaks a UDP bind on
+            # cfg.system_address, breaking the NEXT connect()). No public API
+            # for this; use the same private hook mavsdk itself calls on reconnect.
+            stop = getattr(self._system, "_stop_mavsdk_server", None)
+            if callable(stop):
+                stop()
         self._system = None
 
     async def _cache_stream(self, stream, key: str) -> None:  # pragma: no cover (needs SITL)
@@ -307,14 +315,26 @@ class PX4Backend:
             import cv2  # lazy: only needed in rtsp mode
 
             cap = cv2.VideoCapture(self.cfg.rtsp_url)
-            ok, frame = cap.read()
-            cap.release()
-            if ok:
+            try:
+                if not cap.isOpened():
+                    return False
+                # The first reads on an H.264 RTSP stream can precede the first
+                # keyframe (partial/failed decode), and a buffered frame can be
+                # stale. Read a handful and keep the LAST good one: freshest
+                # image, past the keyframe warm-up.
+                frame = None
+                for _ in range(5):
+                    ok, f = cap.read()
+                    if ok and f is not None:
+                        frame = f
+                if frame is None:
+                    return False
                 cv2.imwrite(str(out), frame)
                 return True
+            finally:
+                cap.release()
         except Exception:
-            pass
-        return False
+            return False
 
     async def hold(self) -> None:
         self._require_connected()
