@@ -95,6 +95,10 @@ class Goto(_Model):
     to: GeoPoint
     alt_m: float = Field(gt=0.0, le=120.0)
     speed_ms: float = Field(default=5.0, gt=0.0, le=8.0)
+    # Optional arrival heading (compass deg). Static shots need the camera
+    # FACING the structure; orbit gets this via face_center, goto gets it here.
+    # Purely photographic — no safety semantics — so no policy rule attaches.
+    yaw_deg: float | None = Field(default=None, ge=0.0, lt=360.0)
 
 
 class Orbit(_Model):

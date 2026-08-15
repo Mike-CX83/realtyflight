@@ -289,7 +289,7 @@ class MissionExecutor:
             await b.takeoff(step.alt_m, idem=idem)
             await self._require_alt(step.alt_m, tolerance=1.5)
         elif isinstance(step, Goto):
-            await b.goto(step.to, step.alt_m, step.speed_ms, None, idem=idem)
+            await b.goto(step.to, step.alt_m, step.speed_ms, step.yaw_deg, idem=idem)
             await self._require_position(step.to)
         elif isinstance(step, Orbit):
             await self._fly_orbit(i, step, idem)

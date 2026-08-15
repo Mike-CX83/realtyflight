@@ -96,36 +96,21 @@ def pick_model(arg: str | None) -> str | None:
 
 
 def scripted_model(prop: Property):
-    """A deterministic stand-in 'LLM' for keyless dry runs: emits the canonical
-    exterior package (same shape the planner tests use). The point of the demo
-    is the PIPELINE — this lets you run it end-to-end with zero credentials."""
+    """A deterministic stand-in 'LLM' for keyless dry runs — compiled straight
+    from the shot library (D9), so the demo dogfoods the same patterns the
+    live planner is taught. The point of the demo is the PIPELINE — this lets
+    you run it end-to-end with zero credentials."""
     from pydantic_ai.messages import ModelResponse, ToolCallPart
     from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-    center = {"lat": prop.center.lat, "lon": prop.center.lon}
+    from planner.shots import exterior_package
+
     draft = {
-        "summary": "Exterior package: elevated orbit of the structure with 8 bracketed "
-        "captures, one straight-down lot shot, then home and land. [scripted demo model]",
-        "steps": [
-            {"action": "takeoff", "alt_m": 22.0},
-            {"action": "set_gimbal", "pitch_deg": -25.0},
-            {
-                "action": "orbit",
-                "center": center,
-                "radius_m": 20.0,
-                "alt_m": 22.0,
-                "speed_ms": 3.0,
-                "arc_deg": 360.0,
-                "direction": "cw",
-                "captures_every_deg": 45.0,
-                "capture": {"mode": "bracket3", "tag": "exterior_orbit"},
-            },
-            {"action": "goto", "to": center, "alt_m": 38.0, "speed_ms": 3.0},
-            {"action": "set_gimbal", "pitch_deg": -90.0},
-            {"action": "capture_photo", "capture": {"mode": "single", "tag": "lot_overhead"}},
-            {"action": "return_home"},
-            {"action": "land"},
-        ],
+        "summary": "Full exterior package from the shot library: front 3/4 hero, "
+        "360-degree orbit with 8 bracketed captures, rear elevated, straight-down "
+        "lot shot, then home and land. [scripted demo model]",
+        "steps": [s.model_dump(mode="json", exclude_none=True)
+                  for s in exterior_package(prop)],
     }
 
     def fn(messages, info: AgentInfo) -> ModelResponse:
