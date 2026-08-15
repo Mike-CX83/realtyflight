@@ -302,11 +302,13 @@ class MissionExecutor:
         elif isinstance(step, Hold):
             await asyncio.sleep(0)  # holds are simulated instantly at core level
         elif isinstance(step, ReturnHome):
-            self.machine.begin_return()
+            if self.machine.current_state.id != "returning":
+                self.machine.begin_return()
             await b.return_home(idem=idem)
             await self._require_position(self.plan.property.home, tolerance_scale=2.0)
         elif isinstance(step, Land):
-            self.machine.begin_landing()
+            if self.machine.current_state.id != "landing":
+                self.machine.begin_landing()
             await b.land(idem=idem)
             await self._require_landed()
 
