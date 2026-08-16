@@ -121,7 +121,8 @@ def parse_and_validate(
             results=[
                 RuleResult(
                     rule="SCHEMA-01",
-                    description="Plan parses into the typed schema; unknown actions/fields rejected",
+                    description="Plan parses into the typed schema; "
+                    "unknown actions/fields rejected",
                     passed=False,
                     violations=violations,
                 )
@@ -134,7 +135,8 @@ def parse_and_validate(
             results=[
                 RuleResult(
                     rule="SCHEMA-01",
-                    description="Plan parses into the typed schema; unknown actions/fields rejected",
+                    description="Plan parses into the typed schema; "
+                    "unknown actions/fields rejected",
                     passed=False,
                     violations=[Violation(rule="SCHEMA-01", message=f"Not valid JSON: {exc}")],
                 )

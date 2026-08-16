@@ -98,7 +98,7 @@ def test_apr01_edit_after_approval_voids_it(good_dict, good_ctx):
 def test_apr01_expires_unused(good_plan, good_ctx):
     a = _approved(good_plan, good_ctx)
     late = NOW + APPROVAL_TTL_S + 1.0
-    stale_live = dataclasses.replace(good_ctx)  # telemetry ts fixed at NOW-0.5...
+    _stale_live = dataclasses.replace(good_ctx)  # telemetry ts fixed at NOW-0.5...
     violations = check_dispatch(good_plan, _dctx(good_ctx, a, now_ts=late))
     assert any(v.rule == "APR-01" and "expired" in v.message for v in violations)
 

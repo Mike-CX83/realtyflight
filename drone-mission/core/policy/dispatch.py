@@ -20,7 +20,7 @@ dispatches until a human resets it — state changes alone are never enough
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from core.approval import ApprovalRecord
 from core.policy.engine import LIVE_RULES
@@ -116,7 +116,8 @@ def rule_env_01_profile_wall(plan: MissionPlan, dctx: DispatchContext) -> list[V
         return [
             Violation(
                 rule="ENV-01",
-                message="Cannot verify sim/real status: no backend capabilities. Denied by default.",
+                message="Cannot verify sim/real status: no backend capabilities. "
+                "Denied by default.",
             )
         ]
 

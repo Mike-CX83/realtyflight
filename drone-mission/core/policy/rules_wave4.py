@@ -178,8 +178,10 @@ def rule_pwr_02_endurance(plan: MissionPlan, ctx: ValidationContext) -> list[Vio
                 rule="PWR-02",
                 message=(
                     f"Estimated mission time {est_min:.1f} min exceeds the usable battery budget "
-                    f"{available_min:.1f} min (endurance {ctx.capabilities.endurance_min_conservative:g} min "
-                    f"x battery {tel.battery_pct:g}% minus {plan.failsafe.battery_reserve_pct:g}% reserve)."
+                    f"{available_min:.1f} min (endurance "
+                    f"{ctx.capabilities.endurance_min_conservative:g} min "
+                    f"x battery {tel.battery_pct:g}% minus "
+                    f"{plan.failsafe.battery_reserve_pct:g}% reserve)."
                 ),
                 value=round(est_min, 1),
                 limit=round(available_min, 1),
@@ -227,8 +229,8 @@ def rule_cap_01_backend_supports_plan(plan: MissionPlan, ctx: ValidationContext)
                 Violation(
                     rule="CAP-01",
                     step=i,
-                    message=f"Backend '{caps.name}' cannot take off below {caps.min_takeoff_alt_m:g} m "
-                    f"(plan asks {step.alt_m:g} m).",
+                    message=f"Backend '{caps.name}' cannot take off below "
+                    f"{caps.min_takeoff_alt_m:g} m (plan asks {step.alt_m:g} m).",
                     value=step.alt_m,
                     limit=caps.min_takeoff_alt_m,
                 )
@@ -238,7 +240,8 @@ def rule_cap_01_backend_supports_plan(plan: MissionPlan, ctx: ValidationContext)
                 Violation(
                     rule="CAP-01",
                     step=i,
-                    message=f"Backend '{caps.name}' has no controllable gimbal; remove set_gimbal steps.",
+                    message=f"Backend '{caps.name}' has no controllable gimbal; "
+                    "remove set_gimbal steps.",
                 )
             )
         elif isinstance(step, CapturePhoto) and step.capture.mode not in caps.supports_bracketing:

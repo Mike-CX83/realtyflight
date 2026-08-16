@@ -8,7 +8,7 @@ import dataclasses
 
 import pytest
 
-from core.interfaces import BackendCapabilities, TelemetrySnapshot
+from core.interfaces import TelemetrySnapshot
 from core.policy import ValidationContext
 from core.policy.engine import validate_plan
 from core.policy.rules_wave4 import estimate_mission_duration_s
@@ -178,7 +178,9 @@ def test_cap01_bracket_unsupported(good_plan, good_ctx):
     ctx = _ctx_with(good_ctx, capabilities=basic)
     report = validate_plan(good_plan, ctx)  # fixture orbit uses bracket3
     v = [x for x in report.violations if x.rule == "CAP-01"][0]
-    assert v.value == "bracket3" and "No silent downgrade" in v.message or "not support" in v.message
+    assert (v.value == "bracket3" and "No silent downgrade" in v.message) or (
+        "not support" in v.message
+    )
 
 
 def test_cap01_no_gimbal(good_plan, good_ctx):
@@ -213,7 +215,9 @@ EVIL_CASES = [
 ]
 
 
-@pytest.mark.parametrize(("name", "tel_overrides", "expected"), EVIL_CASES, ids=[c[0] for c in EVIL_CASES])
+@pytest.mark.parametrize(
+    ("name", "tel_overrides", "expected"), EVIL_CASES, ids=[c[0] for c in EVIL_CASES]
+)
 def test_wave4_evil_states_deny(good_plan, good_ctx, name, tel_overrides, expected):
     ctx = _ctx_with(good_ctx, telemetry=_tel(**tel_overrides))
     report = validate_plan(good_plan, ctx)

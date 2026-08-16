@@ -119,7 +119,8 @@ def test_seq02_orbit_captures_are_counted(good_dict):
 
 
 def test_seq03_goto_after_return_home(good_dict):
-    stray = {"action": "goto", "to": {"lat": 36.154, "lon": -95.9929}, "alt_m": 20.0, "speed_ms": 3.0}
+    stray = {"action": "goto", "to": {"lat": 36.154, "lon": -95.9929},
+             "alt_m": 20.0, "speed_ms": 3.0}
     good_dict["steps"].insert(len(good_dict["steps"]) - 1, stray)  # between RTH and land
     plan = MissionPlan.model_validate(good_dict)
     report = validate_plan(plan)
@@ -151,13 +152,23 @@ EVIL_CASES = [
     # (name, mutator, expected_rule_prefixes)
     ("skip_landing", lambda d: d["steps"].pop(), {"SEQ-01"}),
     ("land_twice", lambda d: d["steps"].append({"action": "land"}), {"SEQ-01"}),
-    ("marathon", lambda d: [d["steps"].insert(-2, {"action": "hold", "duration_s": 1.0}) for _ in range(45)], {"SEQ-02"}),
+    ("marathon",
+     lambda d: [d["steps"].insert(-2, {"action": "hold", "duration_s": 1.0})
+                for _ in range(45)],
+     {"SEQ-02"}),
     ("invented_action", lambda d: d["steps"].insert(1, {"action": "strafe_run"}), {"SCHEMA-01"}),
-    ("photo_after_home", lambda d: d["steps"].insert(len(d["steps"]) - 1, {"action": "capture_photo", "capture": {"mode": "single", "tag": "late"}}), {"SEQ-03"}),
+    ("photo_after_home",
+     lambda d: d["steps"].insert(
+         len(d["steps"]) - 1,
+         {"action": "capture_photo", "capture": {"mode": "single", "tag": "late"}},
+     ),
+     {"SEQ-03"}),
 ]
 
 
-@pytest.mark.parametrize(("name", "mutator", "expected"), EVIL_CASES, ids=[c[0] for c in EVIL_CASES])
+@pytest.mark.parametrize(
+    ("name", "mutator", "expected"), EVIL_CASES, ids=[c[0] for c in EVIL_CASES]
+)
 def test_evil_plans_die_with_the_right_rule(good_dict, name, mutator, expected):
     mutator(good_dict)
     plan, report = parse_and_validate(good_dict)

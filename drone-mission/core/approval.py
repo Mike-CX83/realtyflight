@@ -54,7 +54,7 @@ class ApprovalRecord(BaseModel):
             return False
         return (now_ts - self.granted_at_ts) > APPROVAL_TTL_S
 
-    def activated(self, now_ts: float) -> "ApprovalRecord":
+    def activated(self, now_ts: float) -> ApprovalRecord:
         """Immutable activation at first dispatch (frozen model => new record)."""
         return self.model_copy(update={"activated_at_ts": now_ts})
 

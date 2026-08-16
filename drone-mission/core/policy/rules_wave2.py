@@ -29,7 +29,8 @@ def rule_geo_04_altitude(plan: MissionPlan) -> list[Violation]:
                 Violation(
                     rule="GEO-04",
                     step=i,
-                    message=f"Step {i} ('{step.action}') altitude {alt:g} m exceeds the mission ceiling {ceiling:g} m.",
+                    message=f"Step {i} ('{step.action}') altitude {alt:g} m exceeds "
+                    f"the mission ceiling {ceiling:g} m.",
                     value=alt,
                     limit=ceiling,
                 )
@@ -39,7 +40,8 @@ def rule_geo_04_altitude(plan: MissionPlan) -> list[Violation]:
                 Violation(
                     rule="GEO-04",
                     step=i,
-                    message=f"Takeoff altitude {alt:g} m is below the {plan.limits.min_takeoff_alt_m:g} m floor.",
+                    message=f"Takeoff altitude {alt:g} m is below the "
+                    f"{plan.limits.min_takeoff_alt_m:g} m floor.",
                     value=alt,
                     limit=plan.limits.min_takeoff_alt_m,
                 )
@@ -49,7 +51,8 @@ def rule_geo_04_altitude(plan: MissionPlan) -> list[Violation]:
                 Violation(
                     rule="GEO-04",
                     step=i,
-                    message=f"Orbit altitude {alt:g} m is below the {plan.limits.min_orbit_alt_m:g} m floor.",
+                    message=f"Orbit altitude {alt:g} m is below the "
+                    f"{plan.limits.min_orbit_alt_m:g} m floor.",
                     value=alt,
                     limit=plan.limits.min_orbit_alt_m,
                 )
@@ -67,7 +70,8 @@ def rule_kin_01_speed(plan: MissionPlan) -> list[Violation]:
                 Violation(
                     rule="KIN-01",
                     step=i,
-                    message=f"Step {i} ('{step.action}') speed {speed:g} m/s exceeds the mission cap {cap:g} m/s.",
+                    message=f"Step {i} ('{step.action}') speed {speed:g} m/s exceeds "
+                    f"the mission cap {cap:g} m/s.",
                     value=speed,
                     limit=cap,
                 )
@@ -90,7 +94,8 @@ def rule_kin_02_orbit_radius(plan: MissionPlan) -> list[Violation]:
                     step=i,
                     message=(
                         f"Orbit radius {step.radius_m:g} m is under 1.5x the arrival tolerance "
-                        f"({plan.limits.acceptance_radius_m:g} m); minimum here is {min_radius:g} m."
+                        f"({plan.limits.acceptance_radius_m:g} m); "
+                        f"minimum here is {min_radius:g} m."
                     ),
                     value=step.radius_m,
                     limit=min_radius,

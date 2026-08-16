@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from backends.fake import FakeBackend, FakeConfig
+from backends.fake import FakeBackend
 from core.geo import distance_m
 from core.interfaces import DroneBackend
 from core.schema import CaptureSpec, GeoPoint

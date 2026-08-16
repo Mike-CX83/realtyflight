@@ -26,15 +26,20 @@ def good_plan_dict() -> dict[str, Any]:
     return {
         "plan_version": 1,
         "mission_id": "01TESTMISSION0000000000000",
-        "request_text": "Photograph this property: orbit the house and give me an exterior package.",
+        "request_text": "Photograph this property: orbit the house and give me "
+        "an exterior package.",
         "summary": "Take off to 25 m, orbit the house at 20 m radius capturing 8 bracketed photos, "
         "climb for 1 overhead lot shot, return home and land.",
-        "property": {"center": center, "boundary": boundary, "home": {"lat": 36.15360, "lon": -95.99320}},
+        "property": {
+            "center": center, "boundary": boundary,
+            "home": {"lat": 36.15360, "lon": -95.99320},
+        },
         "limits": {},
         "failsafe": {},
         "steps": [
             {"action": "takeoff", "alt_m": 25.0},
-            {"action": "goto", "to": {"lat": 36.15420, "lon": -95.99300}, "alt_m": 25.0, "speed_ms": 4.0},
+            {"action": "goto", "to": {"lat": 36.15420, "lon": -95.99300},
+             "alt_m": 25.0, "speed_ms": 4.0},
             {"action": "set_gimbal", "pitch_deg": -20.0},
             {
                 "action": "orbit",

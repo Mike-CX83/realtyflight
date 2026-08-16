@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from core.geo import distance_m
@@ -41,6 +41,8 @@ from core.interfaces import (
 from core.schema import CaptureSpec, GeoPoint
 
 POLL_S = 0.2
+AUX_STALE_S = 10.0  # auxiliary streams (health/gps/battery) older than this
+#                     stop vouching for their fields (deny-by-default)
 
 
 @dataclass
@@ -72,6 +74,9 @@ class PX4Backend:
 
         # telemetry cache: field -> (value, updated_at_ts)
         self._cache: dict[str, tuple[object, float]] = {}
+        # supervised-cacher failures: (stream_key, error, ts) — a dead stream's
+        # value is REMOVED from the cache, never left behind as stale truth
+        self._stream_errors: list[tuple[str, str, float]] = []
 
     # ------------------------------------------------------------------ setup
 
@@ -136,12 +141,18 @@ class PX4Backend:
                 stop()
         self._system = None
 
-    async def _cache_stream(self, stream, key: str) -> None:  # pragma: no cover (needs SITL)
+    async def _cache_stream(self, stream, key: str) -> None:
         try:
             async for value in stream:
                 self._cache[key] = (value, self.clock())
         except asyncio.CancelledError:
             return
+        except Exception as exc:  # D10: a dead stream must degrade to DENY,
+            # not linger as plausible-looking cached truth. Removing the slot
+            # makes latest_telemetry() return None (no position) or degrade
+            # the affected field; the freshness/deny rules do the rest.
+            self._cache.pop(key, None)
+            self._stream_errors.append((key, repr(exc), self.clock()))
 
     def _get(self, key: str):
         item = self._cache.get(key)
@@ -158,7 +169,25 @@ class PX4Backend:
         battery = self._get("battery")
         vel = self._get("velocity")
         heading = self._get("heading")
-        oldest_ts = min(ts for _v, ts in self._cache.values())
+
+        # D10: the snapshot's ts reflects the FLIGHT-CRITICAL streams (position,
+        # velocity, in_air, armed). Auxiliary streams (health/gps/battery/...)
+        # naturally update slower — letting the slowest of them age the whole
+        # snapshot made fresh position data trip TEL-01 for no safety reason.
+        # Auxiliary staleness degrades its OWN field instead (deny-by-default):
+        # an old health stream stops vouching for GPS; an old battery stream
+        # reports 0% (which PWR-01 then refuses).
+        now = self.clock()
+        critical_ts = [
+            self._cache[k][1]
+            for k in ("position", "velocity", "in_air", "armed")
+            if k in self._cache
+        ]
+        snapshot_ts = min(critical_ts)
+
+        def _aux_fresh(key: str) -> bool:
+            item = self._cache.get(key)
+            return bool(item and (now - item[1]) <= AUX_STALE_S)
 
         speed = 0.0
         vspeed = 0.0
@@ -167,14 +196,18 @@ class PX4Backend:
             vspeed = -vel.down_m_s
 
         return TelemetrySnapshot(
-            ts=oldest_ts,
+            ts=snapshot_ts,
             position=GeoPoint(lat=pos.latitude_deg, lon=pos.longitude_deg),
             alt_rel_m=pos.relative_altitude_m,
             heading_deg=(heading.heading_deg % 360.0) if heading else 0.0,
             speed_ms=speed,
             vspeed_ms=vspeed,
-            battery_pct=battery.remaining_percent if battery else 0.0,
-            gps_ok=bool(health.is_global_position_ok) if health else False,
+            battery_pct=(
+                battery.remaining_percent if battery and _aux_fresh("battery") else 0.0
+            ),
+            gps_ok=(
+                bool(health.is_global_position_ok) if health and _aux_fresh("health") else False
+            ),
             sat_count=gps.num_satellites if gps else None,
             link_ok=True,  # we ARE receiving telemetry; staleness is judged by ts
             flight_mode=str(self._get("flight_mode") or "UNKNOWN"),
@@ -197,7 +230,9 @@ class PX4Backend:
         health = self._get("health")
         battery = self._get("battery")
         items = [
-            PreflightItem(name="telemetry", ok=bool(self._cache), detail=f"{len(self._cache)} streams"),
+            PreflightItem(
+                name="telemetry", ok=bool(self._cache), detail=f"{len(self._cache)} streams"
+            ),
             PreflightItem(
                 name="global_position",
                 ok=bool(health.is_global_position_ok) if health else False,
@@ -227,8 +262,10 @@ class PX4Backend:
             await a.takeoff()
         except Exception as exc:
             raise CommandRejected(f"takeoff rejected: {exc}") from exc
-        await self._wait(lambda t: t.in_air and abs(t.alt_rel_m - alt_m) <= self.cfg.alt_tolerance_m,
-                         f"takeoff to {alt_m} m")
+        await self._wait(
+            lambda t: t.in_air and abs(t.alt_rel_m - alt_m) <= self.cfg.alt_tolerance_m,
+            f"takeoff to {alt_m} m",
+        )
         self._done(idem)
 
     async def goto(
@@ -246,7 +283,10 @@ class PX4Backend:
             except Exception:
                 pass  # older firmwares reject outside offboard; cruise default then applies
             await a.goto_location(
-                p.lat, p.lon, self._home_abs_alt + alt_m, yaw_deg if yaw_deg is not None else float("nan")
+                p.lat,
+                p.lon,
+                self._home_abs_alt + alt_m,
+                yaw_deg if yaw_deg is not None else float("nan"),
             )
         except Exception as exc:
             raise CommandRejected(f"goto rejected: {exc}") from exc
@@ -275,7 +315,9 @@ class PX4Backend:
         except Exception as exc:
             # Gimbal-less airframe or protocol quirk: record-and-continue is the
             # sim-world call; strictness for real aircraft arrives with G5 work.
-            self._note_media_event("gimbal_unavailable", {"pitch_deg": pitch_deg, "error": str(exc)})
+            self._note_media_event(
+                "gimbal_unavailable", {"pitch_deg": pitch_deg, "error": str(exc)}
+            )
         self._done(idem)
 
     async def capture_photo(self, spec: CaptureSpec, *, idem: str) -> MediaRef:
@@ -284,13 +326,23 @@ class PX4Backend:
         tel = await self.latest_telemetry()
         ref = self._media_ref_for(idem, spec)
         media_path = Path(self.cfg.media_dir)
-        media_path.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(media_path.mkdir, parents=True, exist_ok=True)
         jpg = media_path / f"{ref.media_id}_{spec.tag}.jpg"
 
         frame_written = False
         if self.cfg.camera_mode == "rtsp":
-            frame_written = self._grab_rtsp_frame(jpg)
-        if not frame_written:  # synthetic fallback: evidence stub
+            # D10: cv2 is blocking C code — running it on the event loop
+            # starves the MAVSDK telemetry cachers (the D8 review finding).
+            frame_written = await asyncio.to_thread(self._grab_rtsp_frame, jpg)
+            if not frame_written:
+                # In the real-camera profile a missing frame is a FAILURE the
+                # executor must see (bounded retries, then failsafe) — never a
+                # silent synthetic stub that reports success.
+                raise CommandTimeout(
+                    f"RTSP frame grab failed ({self.cfg.rtsp_url}) — refusing to "
+                    "substitute a synthetic image in rtsp mode"
+                )
+        if not frame_written:  # synthetic mode: honest evidence stub
             jpg.write_bytes(_STUB_JPEG)
 
         sidecar = jpg.with_suffix(".json")
@@ -354,7 +406,10 @@ class PX4Backend:
         home = self._home
         await self._wait(
             lambda t: (not t.in_air)
-            or (home is not None and distance_m(t.position, home) <= self.cfg.arrive_tolerance_m * 2),
+            or (
+                home is not None
+                and distance_m(t.position, home) <= self.cfg.arrive_tolerance_m * 2
+            ),
             "return to launch",
         )
         self._done(idem)

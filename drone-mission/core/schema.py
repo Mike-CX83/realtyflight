@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Annotated, Literal, Union
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -138,7 +138,7 @@ class Land(_Model):
 
 
 MissionStep = Annotated[
-    Union[Takeoff, Goto, Orbit, SetGimbal, CapturePhoto, Hold, ReturnHome, Land],
+    Takeoff | Goto | Orbit | SetGimbal | CapturePhoto | Hold | ReturnHome | Land,
     Field(discriminator="action"),
 ]
 
@@ -151,6 +151,18 @@ WORK_ACTIONS: frozenset[str] = frozenset(
 # --------------------------------------------------------------------------- #
 # The plan envelope
 # --------------------------------------------------------------------------- #
+
+
+def orbit_capture_count(arc_deg: float, every_deg: float) -> int:
+    """Captures an orbit ring actually performs: one at 0°, then at every°,
+    2·every°, ... strictly BELOW arc_deg (the seam rule: a full circle's last
+    waypoint is the first one again — no duplicate photo). This is the single
+    source of truth used by BOTH the forecast (expected_capture_count → SEQ-02
+    and PWR-02 budgets) and the executor's orbit loop; D10 review found the
+    two disagreeing on partial arcs."""
+    import math
+
+    return int(math.floor((arc_deg - 1e-9) / every_deg)) + 1
 
 
 class MissionPlan(_Model):
@@ -166,13 +178,22 @@ class MissionPlan(_Model):
     # ---- derived helpers (not serialized) ---------------------------------- #
 
     def expected_capture_count(self) -> int:
-        """Total photos this plan will attempt (CapturePhoto steps + orbit captures)."""
+        """Total photos this plan will attempt (CapturePhoto steps + orbit
+        captures). Uses the same counting function as the executor's orbit
+        loop, and counts an orbit only when it has BOTH a cadence and a
+        capture spec — exactly the executor's condition (D10 P1 fix: the old
+        forecast disagreed with execution on partial arcs and capture-less
+        orbits, silently skewing SEQ-02 and PWR-02 budgets)."""
         count = 0
         for step in self.steps:
             if isinstance(step, CapturePhoto):
                 count += 1
-            elif isinstance(step, Orbit) and step.captures_every_deg is not None:
-                count += max(1, int(step.arc_deg // step.captures_every_deg))
+            elif (
+                isinstance(step, Orbit)
+                and step.captures_every_deg is not None
+                and step.capture is not None
+            ):
+                count += orbit_capture_count(step.arc_deg, step.captures_every_deg)
         return count
 
 

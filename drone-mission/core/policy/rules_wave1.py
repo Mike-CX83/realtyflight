@@ -35,7 +35,8 @@ def rule_seq_01_shape(plan: MissionPlan) -> list[Violation]:
         v.append(
             Violation(
                 rule="SEQ-01",
-                message=f"A mission needs at least takeoff, return_home, land (got {len(steps)} steps).",
+                message=f"A mission needs at least takeoff, return_home, land "
+                f"(got {len(steps)} steps).",
                 value=len(steps),
                 limit=3,
             )
@@ -98,7 +99,8 @@ def rule_seq_02_counts(plan: MissionPlan) -> list[Violation]:
         v.append(
             Violation(
                 rule="SEQ-02",
-                message=f"Plan would capture ~{n_caps} photos; limit is {plan.limits.max_captures}.",
+                message=f"Plan would capture ~{n_caps} photos; "
+                f"limit is {plan.limits.max_captures}.",
                 value=n_caps,
                 limit=plan.limits.max_captures,
             )

@@ -11,8 +11,8 @@ No SDK imports allowed in this file, ever.
 
 from __future__ import annotations
 
-from typing import Literal, Protocol, runtime_checkable
 from collections.abc import AsyncIterator
+from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 

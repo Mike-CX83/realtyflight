@@ -60,7 +60,9 @@ async def main() -> None:
     print(f"  arrival evidence: {distance_m(tel.position, target):.1f} m from target")
 
     print("capture (synthetic evidence photo)...")
-    ref = await backend.capture_photo(CaptureSpec(mode="single", tag="smoke_test"), idem="smoke:cap")
+    ref = await backend.capture_photo(
+        CaptureSpec(mode="single", tag="smoke_test"), idem="smoke:cap"
+    )
     print(f"  media: {ref.path}")
 
     print("return to launch...")

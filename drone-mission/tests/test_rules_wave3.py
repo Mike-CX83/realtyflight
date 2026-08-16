@@ -40,8 +40,9 @@ def test_localframe_east_is_positive_x():
 
 
 def test_localframe_agrees_with_haversine():
-    from core.geo import distance_m
     import math
+
+    from core.geo import distance_m
 
     o = GeoPoint(lat=36.1536, lon=-95.9932)
     p = GeoPoint(lat=36.1544, lon=-95.9921)
@@ -197,7 +198,9 @@ EVIL_CASES = [
 ]
 
 
-@pytest.mark.parametrize(("name", "mutator", "expected"), EVIL_CASES, ids=[c[0] for c in EVIL_CASES])
+@pytest.mark.parametrize(
+    ("name", "mutator", "expected"), EVIL_CASES, ids=[c[0] for c in EVIL_CASES]
+)
 def test_wave3_evil_plans_die_with_the_right_rules(good_dict, name, mutator, expected):
     mutator(good_dict)
     plan, report = parse_and_validate(good_dict)

@@ -55,7 +55,8 @@ class EventLog:
         )
         seq = int(cur.fetchone()[0])
         self._conn.execute(
-            "INSERT INTO mission_events (mission_id, seq, ts, type, payload) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO mission_events (mission_id, seq, ts, type, payload) "
+            "VALUES (?, ?, ?, ?, ?)",
             (mission_id, seq, ts, type_, json.dumps(payload, sort_keys=True)),
         )
         self._conn.commit()

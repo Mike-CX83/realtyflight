@@ -22,7 +22,7 @@ import asyncio
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 
 from core.approval import ApprovalRecord
 from core.engine.machine import MissionMachine
@@ -54,7 +54,7 @@ LANDED_MAX_VSPEED_MS = 0.75
 MAX_RETRIES = 2
 
 
-class MissionOutcome(str, Enum):
+class MissionOutcome(StrEnum):
     COMPLETED = "completed"
     ABORTED = "aborted"            # operator abort, recovered safely (terminal state: completed)
     FAILED = "failed"
@@ -300,7 +300,18 @@ class MissionExecutor:
             self.media.append(ref)
             self.rec.record("media.captured", step=i, tag=ref.tag, media_id=ref.media_id)
         elif isinstance(step, Hold):
-            await asyncio.sleep(0)  # holds are simulated instantly at core level
+            # D10 P1: a hold must actually hold (the plan's endurance budget
+            # charges for it), and it must stay abortable — waiting on the
+            # abort event (not a blind sleep) means abort() interrupts it
+            # instantly instead of stalling the recovery for duration_s.
+            await b.hold()
+            try:
+                await asyncio.wait_for(
+                    self._abort_requested.wait(), timeout=step.duration_s
+                )
+                raise asyncio.CancelledError()  # abort during hold -> recovery
+            except TimeoutError:
+                pass  # full hold elapsed — the normal case
         elif isinstance(step, ReturnHome):
             if self.machine.current_state.id != "returning":
                 self.machine.begin_return()
@@ -315,9 +326,6 @@ class MissionExecutor:
     async def _fly_orbit(self, i: int, step: Orbit, idem: str) -> None:
         """Portable orbit: a ring of goto waypoints, yaw facing center, captures
         at the marked angles (doc 04 §5 — the form every backend can fly)."""
-        from core.geo import LocalFrame
-
-        frame = LocalFrame(step.center)
         n_segments = max(4, int(step.arc_deg // 12))
         capture_every = step.captures_every_deg
         next_capture_angle = 0.0
@@ -396,6 +404,25 @@ class MissionExecutor:
             m.operator_abort()
         await self.backend.abort_motion()
         await self._recovery_flight()
+        # D10 P0: a terminal "completed" requires LANDED EVIDENCE, not just
+        # having reached the landing state. If recovery's own commands failed
+        # (recovery.failed swallows them so we still get here), the aircraft
+        # may be airborne — reporting "completed" then would be a lie.
+        if not await self._landed_evidence():
+            self.rec.record(
+                "recovery.unresolved",
+                at_step=at_step,
+                why="no touchdown evidence after abort recovery",
+            )
+            if m.current_state.id not in ("failed", "completed"):
+                m.fail()
+            return MissionResult(
+                outcome=MissionOutcome.FAILED,
+                final_state=m.current_state.id,
+                reason="operator abort; recovery unresolved — no touchdown evidence",
+                steps_completed=self._steps_completed,
+                media=self.media,
+            )
         m.touchdown() if m.current_state.id == "landing" else None
         return MissionResult(
             outcome=MissionOutcome.ABORTED,
@@ -420,6 +447,17 @@ class MissionExecutor:
             reason=reason,
             steps_completed=self._steps_completed,
             media=self.media,
+        )
+
+    async def _landed_evidence(self) -> bool:
+        """True only when telemetry PROVES the aircraft is on the ground.
+        Missing telemetry is not evidence (deny-by-default)."""
+        tel = await self.backend.latest_telemetry()
+        return bool(
+            tel
+            and not tel.in_air
+            and tel.alt_rel_m <= LANDED_MAX_ALT_M
+            and abs(tel.vspeed_ms) <= LANDED_MAX_VSPEED_MS
         )
 
     async def _recovery_flight(self) -> None:
@@ -450,8 +488,13 @@ class MissionExecutor:
     # ------------------------------------------------------------ misc utils
 
     async def _wait_resume(self) -> None:
-        while not self._resume_requested.is_set() and not self._abort_requested.is_set():
-            await asyncio.sleep(self.tuning.poll_interval_s)
+        resume = asyncio.ensure_future(self._resume_requested.wait())
+        abort = asyncio.ensure_future(self._abort_requested.wait())
+        try:
+            await asyncio.wait({resume, abort}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            resume.cancel()
+            abort.cancel()
         self._resume_requested.clear()
 
     def _expected_duration_s(self, step) -> float:

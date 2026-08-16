@@ -169,7 +169,9 @@ EVIL_CASES = [
 ]
 
 
-@pytest.mark.parametrize(("name", "mutator", "expected"), EVIL_CASES, ids=[c[0] for c in EVIL_CASES])
+@pytest.mark.parametrize(
+    ("name", "mutator", "expected"), EVIL_CASES, ids=[c[0] for c in EVIL_CASES]
+)
 def test_wave2_evil_plans_die_with_the_right_rules(good_dict, name, mutator, expected):
     mutator(good_dict)
     plan, report = parse_and_validate(good_dict)

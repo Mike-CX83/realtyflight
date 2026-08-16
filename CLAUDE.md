@@ -281,3 +281,7 @@ A strong result is not “the LLM made a drone move.” It is a coherent system 
 - The architecture provides a believable path to the ANAFI Ai or a purpose-built PX4 aircraft without rewriting the AI layer.
 
 Optimize every recommendation for reaching that outcome with the least unnecessary complexity.
+
+## Project memory
+
+Three files share this project's memory. This file is the rules. `TODO.md` is the authoritative live state (done / in progress / next). `JOURNAL.md` is the narrative memory — the story so far, the challenge log (symptom → root cause → fix), and an AI context pack. New session reading order: `CLAUDE.md` → `TODO.md` → `JOURNAL.md` Part IV (Part I when you need the why behind a decision). Any session that changes something durable appends a dated entry to the journal's Part I and refreshes its Part IV. Never write secrets into any of these files.

@@ -10,13 +10,13 @@ import asyncio
 import pytest
 
 from backends.fake import FakeBackend, FakeConfig
-from core.approval import REAL_FLIGHT_CONFIRMATION, grant_approval
+from core.approval import grant_approval
 from core.engine import ExecutorTuning, MissionExecutor, MissionOutcome
 from core.events import EventLog
 from core.interfaces import CommandRejected, CommandTimeout
 from core.policy import ValidationContext
 from core.policy.engine import validate_plan
-from core.schema import GeoPoint, MissionPlan
+from core.schema import MissionPlan
 from tests.conftest import NOW
 
 
@@ -137,7 +137,6 @@ async def test_abort_preempts_hung_command_and_recovers(good_plan: MissionPlan):
 
 async def test_dead_battery_never_leaves_the_ground(good_plan: MissionPlan):
     mk, backend, log, clock = build(good_plan, cfg=FakeConfig(battery_pct=12.0))
-    ex = await mk.__wrapped__() if hasattr(mk, "__wrapped__") else None  # noqa: unused
     # approval itself must refuse: validation with 12% battery fails PWR-01
     from core.approval import ApprovalError
 

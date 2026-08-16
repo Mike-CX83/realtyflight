@@ -6,7 +6,6 @@ validator (never in the prompt)."""
 
 from __future__ import annotations
 
-import pytest
 from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
@@ -118,9 +117,7 @@ async def test_invalid_then_repaired(good_dict):
     assert result.report.ok
     assert result.rounds == 2 and calls["n"] == 2
     # the repair prompt carried the validator's exact complaint
-    assert any("GEO-04" in line for line in result.transcript if line.startswith("REPAIR") or "VALIDATION" in line) or any(
-        "GEO-04" in t for t in result.transcript
-    )
+    assert any("GEO-04" in t for t in result.transcript)
 
 
 async def test_hopeless_model_fails_honestly(good_dict):
