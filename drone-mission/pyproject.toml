@@ -10,6 +10,8 @@ dependencies = [
     "python-statemachine>=3.0",
     "pydantic-ai-slim>=2.0",  # add provider extras at runtime, e.g. pydantic-ai-slim[anthropic]
     "mavsdk>=3.0",            # PX4 backend (bundles mavsdk_server incl. macOS arm64)
+    "fastapi>=0.115",         # D11 dashboard server (docs 14 §1)
+    "uvicorn>=0.30",          # ASGI server for the dashboard
 ]
 
 [project.optional-dependencies]
@@ -18,6 +20,7 @@ dev = [
     "pytest-asyncio>=1.0",
     "ruff>=0.5",
     "mypy>=1.10",
+    "httpx>=0.27",   # FastAPI TestClient transport for tests/test_server.py
 ]
 camera = [
     "opencv-python>=4.9",  # only needed for PX4Backend camera_mode="rtsp"

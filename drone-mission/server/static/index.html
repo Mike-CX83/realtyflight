@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RealtyFlight</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<style>
+  :root {
+    color-scheme: light;
+    --page:#f9f9f7; --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+    --hair:#e1e0d9; --border:rgba(11,11,11,.10); --accent:#2a78d6;
+    --good:#0ca30c; --warn:#fab219; --crit:#d03b3b;
+  }
+  @media (prefers-color-scheme: dark) { :root {
+    color-scheme: dark;
+    --page:#0d0d0d; --surface:#1a1a19; --ink:#fff; --ink2:#c3c2b7; --muted:#898781;
+    --hair:#2c2c2a; --border:rgba(255,255,255,.10); --accent:#3987e5;
+  }}
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--page); color:var(--ink);
+         font:15px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif; padding-bottom:40px; }
+  .wrap { max-width:760px; margin:0 auto; padding:14px 12px; }
+  header { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:10px; }
+  h1 { font-size:18px; }
+  .badge { font-size:12px; font-weight:600; border:1px solid var(--hair); border-radius:999px;
+           padding:3px 10px; color:var(--ink2); display:inline-flex; gap:6px; align-items:center; }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--muted); }
+  .dot.on { background:var(--good); }
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:12px;
+          padding:12px 14px; margin-bottom:10px; }
+  .card h2 { font-size:12px; text-transform:uppercase; letter-spacing:.07em; color:var(--muted); margin-bottom:8px; }
+  input, textarea { width:100%; background:var(--page); color:var(--ink); border:1px solid var(--hair);
+          border-radius:9px; padding:9px 11px; font:inherit; }
+  textarea { min-height:64px; resize:vertical; }
+  .row { display:flex; gap:8px; margin-top:8px; }
+  .row > * { flex:1; }
+  button { font:inherit; font-weight:650; border:0; border-radius:10px; padding:11px 14px;
+           cursor:pointer; background:var(--accent); color:#fff; }
+  button.ghost { background:transparent; color:var(--ink2); border:1px solid var(--hair); }
+  button.approve { background:var(--good); font-size:16px; width:100%; padding:13px; }
+  button.abort { background:var(--crit); }
+  button.warn { background:var(--warn); color:#0b0b0b; }
+  button:disabled { opacity:.45; cursor:default; }
+  #map { height:300px; border-radius:12px; border:1px solid var(--border); }
+  .tel { display:flex; gap:14px; flex-wrap:wrap; margin-top:8px; font-size:12.5px; color:var(--ink2); }
+  .tel b { display:block; font-size:16px; color:var(--ink); font-variant-numeric:tabular-nums; }
+  .checklist { font-size:13px; }
+  .checklist div { padding:3px 0; border-bottom:1px solid var(--hair); display:flex; gap:8px; }
+  .checklist div:last-child { border-bottom:0; }
+  .ok { color:var(--good); font-weight:700; }
+  .fail { color:var(--crit); font-weight:700; }
+  .steps { font-size:12.5px; color:var(--ink2); max-height:150px; overflow:auto; }
+  .steps div { padding:2px 0; }
+  .gallery { display:grid; grid-template-columns:repeat(auto-fill,minmax(96px,1fr)); gap:8px; }
+  .gallery a { display:block; border:1px solid var(--hair); border-radius:8px; overflow:hidden;
+               font-size:10.5px; color:var(--ink2); text-align:center; text-decoration:none; }
+  .gallery img { width:100%; height:70px; object-fit:cover; display:block; background:var(--page); }
+  .muted { color:var(--muted); font-size:12.5px; }
+  #log { font-size:12px; color:var(--ink2); max-height:180px; overflow:auto;
+         font-family:ui-monospace,Menlo,monospace; }
+  .hidden { display:none; }
+  .summary { font-size:13.5px; color:var(--ink2); margin-bottom:8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>RealtyFlight</h1>
+    <span class="badge"><span class="dot" id="conn-dot"></span><span id="conn-text">offline</span></span>
+  </header>
+
+  <div class="card" id="auth-card">
+    <h2>Operator</h2>
+    <div class="row">
+      <input id="operator" placeholder="your name" autocomplete="name">
+      <input id="token" placeholder="session token (from the server console)" type="password">
+    </div>
+    <div class="row"><button id="connect">Connect</button></div>
+  </div>
+
+  <div id="main" class="hidden">
+    <div class="card">
+      <h2>Mission request</h2>
+      <textarea id="intent" placeholder="Photograph this property: orbit the house, full exterior package."></textarea>
+      <div class="row"><button id="plan">Plan mission</button></div>
+      <div class="muted" id="plan-status"></div>
+    </div>
+
+    <div class="card hidden" id="plan-card">
+      <h2>Proposed plan — review before anything flies</h2>
+      <div class="summary" id="summary"></div>
+      <div class="tel">
+        <span>photos<b id="p-photos">–</b></span>
+        <span>est. time<b id="p-est">–</b></span>
+        <span>plan hash<b id="p-hash" style="font-size:12px">–</b></span>
+        <span>LLM rounds<b id="p-rounds">–</b></span>
+      </div>
+      <h2 style="margin-top:10px">Safety checklist</h2>
+      <div class="checklist" id="checklist"></div>
+      <h2 style="margin-top:10px">Steps</h2>
+      <div class="steps" id="steps"></div>
+      <div class="row"><button class="approve" id="approve">APPROVE — authorize simulated flight</button></div>
+    </div>
+
+    <div class="card">
+      <h2>Live flight</h2>
+      <div id="map"></div>
+      <div class="tel">
+        <span>state<b id="t-state">–</b></span>
+        <span>alt<b id="t-alt">–</b></span>
+        <span>battery<b id="t-batt">–</b></span>
+        <span>from home<b id="t-dist">–</b></span>
+        <span>steps<b id="t-steps">–</b></span>
+        <span>photos<b id="t-photos">–</b></span>
+      </div>
+      <div class="row">
+        <button class="abort" id="abort">ABORT → home</button>
+        <button class="warn" id="hold">HOLD</button>
+        <button class="ghost" id="resume">Resume</button>
+        <button class="ghost" id="breaker">Breaker</button>
+      </div>
+      <div class="muted" id="outcome"></div>
+    </div>
+
+    <div class="card">
+      <h2>Photos</h2>
+      <div class="gallery" id="gallery"><span class="muted">none yet</span></div>
+    </div>
+
+    <div class="card">
+      <h2>Replay</h2>
+      <div class="row"><button class="ghost" id="load-missions">Load past missions</button></div>
+      <div id="missions" class="steps"></div>
+      <div id="log"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  let TOKEN = "", OPERATOR = "", ws = null, map = null, drone = null, trail = null,
+      boundaryLayer = null, breakerOpen = false;
+
+  const $ = id => document.getElementById(id);
+  const hdrs = () => ({ "Authorization": "Bearer " + TOKEN, "Content-Type": "application/json" });
+  async function api(path, method = "GET", body = null) {
+    const r = await fetch(path, { method, headers: hdrs(), body: body ? JSON.stringify(body) : null });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.detail || r.status);
+    return data;
+  }
+
+  function initMap(home) {
+    if (map) return;
+    map = L.map("map", { zoomControl: false }).setView([home.lat, home.lon], 18);
+    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+      { maxZoom: 19, attribution: "© OpenStreetMap" }).addTo(map);
+    trail = L.polyline([], { weight: 3 }).addTo(map);
+    drone = L.circleMarker([home.lat, home.lon], { radius: 8, weight: 2 }).addTo(map);
+  }
+
+  function renderPlan(p) {
+    $("plan-card").classList.remove("hidden");
+    $("summary").textContent = p.summary;
+    $("p-photos").textContent = p.expected_photos;
+    $("p-est").textContent = p.est_minutes + " min";
+    $("p-hash").textContent = p.plan_hash + "…";
+    $("p-rounds").textContent = p.rounds;
+    $("checklist").innerHTML = p.report.map(r =>
+      `<div><span class="${r.passed ? "ok" : "fail"}">${r.passed ? "✓" : "✗"}</span>` +
+      `<span><b>${r.rule}</b> — ${r.description}` +
+      (r.violations.length ? `<br><span class="fail">${r.violations.join("<br>")}</span>` : "") +
+      `</span></div>`).join("");
+    $("steps").innerHTML = p.steps.map((s, i) =>
+      `<div>${String(i).padStart(2, "0")} · ${s.action}` +
+      (s.alt_m ? ` @ ${s.alt_m} m` : "") +
+      (s.capture ? ` · 📷 ${s.capture.tag}` : "") + `</div>`).join("");
+    $("approve").disabled = !p.ok;
+    initMap(p.home);
+    if (boundaryLayer) boundaryLayer.remove();
+    boundaryLayer = L.polygon(p.boundary.map(q => [q.lat, q.lon]),
+      { fillOpacity: 0.06, weight: 2, dashArray: "4 4" }).addTo(map);
+    map.fitBounds(boundaryLayer.getBounds().pad(0.2));
+  }
+
+  function applyState(s) {
+    $("conn-dot").classList.add("on");
+    $("conn-text").textContent = s.backend + (s.breaker_open ? " · BREAKER OPEN" : "");
+    breakerOpen = s.breaker_open;
+    $("t-state").textContent = s.mission_state || "idle";
+    $("t-steps").textContent = s.steps_completed + "/" + (s.steps_total || "–");
+    $("t-photos").textContent = s.photos;
+    if (s.telemetry) {
+      $("t-alt").textContent = s.telemetry.alt_rel_m + " m";
+      $("t-batt").textContent = s.telemetry.battery_pct + "%";
+      $("t-dist").textContent = (s.telemetry.dist_home_m ?? "–") + " m";
+      if (map && s.telemetry.lat) {
+        const ll = [s.telemetry.lat, s.telemetry.lon];
+        drone.setLatLng(ll);
+        if (s.mission_active) trail.addLatLng(ll);
+      }
+    }
+    $("outcome").textContent = s.outcome
+      ? `outcome: ${s.outcome}${s.reason ? " — " + s.reason : ""}` : "";
+    if (s.media && s.media.length) {
+      $("gallery").innerHTML = s.media.map(m => {
+        const img = m.path ? `<img src="/media/${m.path.split("/").pop()}?t=${TOKEN}"
+          onerror="this.style.display='none'">` : "";
+        return `<a>${img}<span>${m.tag}</span></a>`;
+      }).join("");
+    }
+  }
+
+  function openWS() {
+    ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws?token=${encodeURIComponent(TOKEN)}`);
+    ws.onmessage = e => applyState(JSON.parse(e.data));
+    ws.onclose = () => { $("conn-dot").classList.remove("on"); $("conn-text").textContent = "offline";
+                         setTimeout(openWS, 2000); };
+  }
+
+  $("connect").onclick = async () => {
+    TOKEN = $("token").value.trim(); OPERATOR = $("operator").value.trim();
+    if (!TOKEN || !OPERATOR) return alert("operator name and token required");
+    try { await api("/api/state"); } catch (e) { return alert("connect failed: " + e.message); }
+    $("auth-card").classList.add("hidden"); $("main").classList.remove("hidden");
+    openWS();
+  };
+
+  $("plan").onclick = async () => {
+    $("plan-status").textContent = "planning…";
+    $("plan").disabled = true;
+    try {
+      const p = await api("/api/plan", "POST",
+        { request_text: $("intent").value || $("intent").placeholder, operator: OPERATOR });
+      if (!p.ok && !p.steps) { $("plan-status").textContent = "planner failed: " + (p.detail || ""); return; }
+      $("plan-status").textContent = p.ok ? "validated — review and approve" : "validation FAILED — see checklist";
+      renderPlan(p);
+    } catch (e) { $("plan-status").textContent = "error: " + e.message; }
+    finally { $("plan").disabled = false; }
+  };
+
+  $("approve").onclick = async () => {
+    try {
+      await api("/api/approve", "POST", { operator: OPERATOR });
+      $("plan-card").classList.add("hidden");
+      if (trail) trail.setLatLngs([]);
+    } catch (e) { alert(e.message); }
+  };
+  $("abort").onclick  = () => api("/api/abort",  "POST", { operator: OPERATOR }).catch(e => alert(e.message));
+  $("hold").onclick   = () => api("/api/hold",   "POST", { operator: OPERATOR }).catch(e => alert(e.message));
+  $("resume").onclick = () => api("/api/resume", "POST", { operator: OPERATOR }).catch(e => alert(e.message));
+  $("breaker").onclick = () => {
+    const action = breakerOpen ? "reset" : "trip";
+    if (!confirm(action === "trip" ? "TRIP the circuit breaker? Nothing will dispatch until a human resets it."
+                                   : "Reset the breaker?")) return;
+    api("/api/breaker", "POST", { operator: OPERATOR, action }).catch(e => alert(e.message));
+  };
+
+  $("load-missions").onclick = async () => {
+    const r = await api("/api/missions");
+    $("missions").innerHTML = r.missions.map(m =>
+      `<div><a href="#" data-id="${m.mission_id}">${m.mission_id}</a> · ${m.events} events</div>`).join("")
+      || "<span class='muted'>none</span>";
+    $("missions").querySelectorAll("a").forEach(a => a.onclick = async ev => {
+      ev.preventDefault();
+      const rep = await api("/api/replay/" + a.dataset.id);
+      $("log").innerHTML = rep.events.map(e =>
+        `<div>${String(e.seq).padStart(3, "0")} ${e.type} ${JSON.stringify(e.payload).slice(0, 90)}</div>`).join("");
+    });
+  };
+})();
+</script>
+</body>
+</html>

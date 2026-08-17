@@ -70,3 +70,18 @@ Dependencies: MIT/BSD/Apache only. GPL/AGPL/PolyForm projects are tools we run
 or texts we read — never imports. Every adoption gets its license noted in
 `pyproject.toml`/README at the moment it lands. This keeps the B5 commercial
 path unencumbered.
+
+## 6. Pantry additions (gap scan 2026-08-16 — small free clients, no new frameworks)
+
+| Need (when) | Source | License/terms | Note |
+|---|---|---|---|
+| Preflight wind advisory (D11+/M7) | NWS API — api.weather.gov | US-gov public domain, keyless | forecast wind at the property on the approval screen, checked against G5 wind limits |
+| Airspace awareness (D12+/product) | FAA UAS Facility Maps (open ArcGIS data) | open data | controlled-airspace + LAANC grid ceiling advisory on the confirm screen; actual LAANC auth = commercial USS, company-era |
+| Defense-day demo insurance — **EVENTUAL, not now (Mike's call 2026-08-16)** | Ollama + a local model | MIT (Ollama) | deliberately deferred to the Linux/RTX box (A-track), which is the right hardware for local models anyway; revisit at M8 rehearsal — planner is provider-neutral, so wiring it later is a model-string change, zero code |
+| EXIF geotagging (M7 media export) | piexif + Pillow | MIT | GPS/attitude into each JPEG's EXIF, not just sidecars — photos drop into MLS/editing tools natively |
+| Real auth, when the stub swaps (post-capstone) | fastapi-users | MIT | the designed swap-point in D11's auth dependency |
+
+Verdict of the gap scan: the remaining build (D11–D13, M4–M8) requires **no new
+frameworks and no paid dependencies** — only small clients to free public APIs.
+The only commercial dependency anywhere on the map stays MLS (fallback: paste
+the listing) and, someday, LAANC authorization providers.
