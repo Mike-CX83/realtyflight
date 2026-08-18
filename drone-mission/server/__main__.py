@@ -37,10 +37,16 @@ async def _run() -> None:
     # onto whichever loop is running right now — it must be the SAME loop uvicorn
     # serves on, or those tasks are silently orphaned the moment this coroutine
     # returns and never advance again (telemetry freezes at its first snapshot).
+    # (D11 regression, reintroduced by the D13 diff and fixed again here.)
     backend = await _build()
     secret = os.environ.get("DASH_SECRET") or secrets.token_urlsafe(18)
     model = os.environ.get("DASH_MODEL") or None
-    app = create_app(backend=backend, model=model, secret=secret)
+    app = create_app(
+        backend=backend, model=model, secret=secret,
+        # D13: set to your county's parcel FeatureServer layer URL to turn
+        # address lookups into REAL parcel boundaries (geocode-only otherwise).
+        parcel_service_url=os.environ.get("DASH_PARCEL_URL") or None,
+    )
 
     host = os.environ.get("DASH_HOST", "0.0.0.0")
     port = int(os.environ.get("DASH_PORT", "8000"))

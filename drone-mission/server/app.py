@@ -31,6 +31,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocke
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import AfterValidator, BaseModel, Field, StringConstraints
 
+from context import ArcGISParcelProvider, LookupFailed, propose_property
 from core.approval import ApprovalError, ApprovalRecord, grant_approval
 from core.engine import MissionExecutor, MissionOutcome, MissionResult
 from core.events import EventLog
@@ -74,6 +75,14 @@ Operator = Annotated[
 class PlanBody(BaseModel):
     request_text: str = Field(min_length=1, max_length=2000)
     operator: Operator
+    # D13: plan against the last looked-up REAL property (the operator saw its
+    # boundary drawn and is ratifying it) instead of the synthetic square.
+    use_looked_up: bool = False
+
+
+class LookupBody(BaseModel):
+    address: str = Field(min_length=3, max_length=300)
+    operator: Operator
 
 
 class OperatorBody(BaseModel):
@@ -112,6 +121,7 @@ class Session:
 
     pending_plan: MissionPlan | None = None
     pending_report: object | None = None      # live-checked ValidationReport
+    pending_property: object | None = None    # D13: last confirmed-able lookup
     approval: ApprovalRecord | None = None
     executor: MissionExecutor | None = None
     mission_task: asyncio.Task | None = None
@@ -152,11 +162,16 @@ def create_app(
     model=None,
     secret: str | None = None,
     log_path: str = "runs/mission_events.sqlite3",
+    parcel_service_url: str | None = None,   # D13: county FeatureServer layer URL
+    parcel_provider=None,                    # D13: injected provider (tests)
 ) -> FastAPI:
     """Build the dashboard app around an already-connected DroneBackend."""
 
     token = secret or secrets.token_urlsafe(24)
     sess = Session(backend=backend, model=model, log_path=log_path)
+    _parcels = parcel_provider or (
+        ArcGISParcelProvider(parcel_service_url) if parcel_service_url else None
+    )
     audit_drops = {"n": 0}  # D12.1: audit-write failures are counted, not silent
 
     from contextlib import asynccontextmanager
@@ -292,6 +307,42 @@ def create_app(
             raise HTTPException(404, "no such media")
         return FileResponse(f)
 
+    # ---- context enrichment (D13): address -> real parcel PROPOSAL ---------- #
+    @app.post("/api/lookup")
+    async def lookup(body: LookupBody, _=Depends(require_token)):
+      async with sess.lock:
+        # Sim flights fly the REAL lot shape translated to the drone's actual
+        # location; real coordinates survive in provenance. Enrichment widens
+        # context, never authority — this is a proposal for the operator.
+        tel = await sess.backend.latest_telemetry()
+        try:
+            proposal = await propose_property(
+                body.address,
+                provider=_parcels,
+                translate_center=(tel.position if tel else None),
+            )
+        except LookupFailed as exc:
+            _audit("SESSION", "lookup.failed", address=body.address,
+                   operator=body.operator, why=str(exc))
+            return {"ok": False, "detail": str(exc)}
+        sess.pending_property = proposal
+        _audit(
+            "SESSION", "lookup.performed",
+            operator=body.operator, address=body.address,
+            matched=proposal.provenance.get("address_matched"),
+            boundary_source=proposal.provenance.get("boundary_source"),
+            translated=proposal.provenance.get("translated"),
+        )
+        p = proposal.property
+        return {
+            "ok": True,
+            "matched_address": proposal.provenance.get("address_matched"),
+            "boundary": [{"lat": q.lat, "lon": q.lon} for q in p.boundary],
+            "home": {"lat": p.home.lat, "lon": p.home.lon},
+            "center": {"lat": p.center.lat, "lon": p.center.lon},
+            "provenance": proposal.provenance,
+        }
+
     # ---- the governed flow -------------------------------------------------- #
     @app.post("/api/plan")
     async def plan(body: PlanBody, _=Depends(require_token)):
@@ -308,7 +359,16 @@ def create_app(
         tel = await sess.backend.latest_telemetry()
         if tel is None:
             raise HTTPException(503, "no telemetry from backend yet")
-        prop = property_around(tel.position)
+        if body.use_looked_up:
+            # D13: the operator is planning against the looked-up REAL parcel
+            # they just saw drawn — the validator judges it like any boundary.
+            if sess.pending_property is None:
+                raise HTTPException(409, "no looked-up property — use /api/lookup first")
+            prop = sess.pending_property.property
+            prop_provenance = sess.pending_property.provenance
+        else:
+            prop = property_around(tel.position)
+            prop_provenance = {"boundary_source": "synthetic-square-around-drone"}
 
         model = sess.model or pick_model(None)
         if model is None:
@@ -366,6 +426,7 @@ def create_app(
             summary=result.plan.summary[:300],
             plan_hash=compute_plan_hash(result.plan),
             rounds=result.rounds,
+            boundary_source=prop_provenance.get("boundary_source"),  # D13
         )
         _audit(
             result.plan.mission_id, "plan.validated",
@@ -390,6 +451,7 @@ def create_app(
                 "lat": result.plan.property.home.lat,
                 "lon": result.plan.property.home.lon,
             },
+            "property_provenance": prop_provenance,   # D13: where the boundary came from
         }
 
     @app.post("/api/approve")

@@ -352,18 +352,38 @@ class PX4Backend:
         if idem not in self._inflight:                    # D12: don't re-send
             self._inflight.add(idem)
             try:
+                # D12.4 (live SITL finding): set_current_speed is IGNORED by
+                # PX4 for goto-style flight in Hold mode — the vehicle cruised
+                # at its default ~5 m/s over 3-4 m/s approvals and the D12.3
+                # monitor (correctly) failsafed the mission. Set the
+                # autopilot's cruise parameter DIRECTLY, so the aircraft
+                # actually flies the approved speed; the monitor stays on as
+                # the enforcement backstop. (Recovery RTL inherits the last
+                # leg's cruise — slower is conservative.)
+                speed_set = False
                 try:
-                    await a.set_current_speed(speed_ms)
+                    await self._system.param.set_param_float(
+                        "MPC_XY_CRUISE", float(speed_ms)
+                    )
+                    speed_set = True
                 except Exception as exc:
-                    # D12 (review C5): an unconfirmed speed is not a free pass.
-                    # We may proceed (older firmwares reject this outside
-                    # offboard), but the evidence wait below then REFUSES on
-                    # observed overspeed — the approved limit holds either way.
-                    speed_confirmed = False
                     self._note_media_event(
-                        "speed_unconfirmed",
+                        "cruise_param_unconfirmed",
                         {"requested_ms": speed_ms, "error": str(exc)},
                     )
+                try:
+                    await a.set_current_speed(speed_ms)
+                    speed_set = True
+                except Exception as exc:
+                    if not speed_set:
+                        # D12 (review C5): an unconfirmed speed is not a free
+                        # pass — the evidence wait below REFUSES on observed
+                        # overspeed either way.
+                        speed_confirmed = False
+                        self._note_media_event(
+                            "speed_unconfirmed",
+                            {"requested_ms": speed_ms, "error": str(exc)},
+                        )
                 await a.goto_location(
                     p.lat,
                     p.lon,

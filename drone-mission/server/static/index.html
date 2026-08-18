@@ -82,6 +82,15 @@
 
   <div id="main" class="hidden">
     <div class="card">
+      <h2>Property</h2>
+      <div class="row">
+        <input id="address" placeholder="address (e.g. 175 E 2nd St, Tulsa, OK)">
+      </div>
+      <div class="row"><button id="lookup">Look up property</button></div>
+      <div class="muted" id="lookup-status">no lookup — planning uses the area around the drone</div>
+    </div>
+
+    <div class="card">
       <h2>Mission request</h2>
       <textarea id="intent" placeholder="Photograph this property: orbit the house, full exterior package."></textarea>
       <div class="row"><button id="plan">Plan mission</button></div>
@@ -228,13 +237,41 @@
     openWS();
   };
 
+  let useLookedUp = false;  // D13: plan against the looked-up REAL parcel
+
+  $("lookup").onclick = async () => {
+    $("lookup-status").textContent = "looking up…";
+    $("lookup").disabled = true;
+    useLookedUp = false;
+    try {
+      const r = await api("/api/lookup", "POST",
+        { address: $("address").value, operator: OPERATOR });
+      if (!r.ok) { $("lookup-status").textContent = "lookup failed: " + r.detail; return; }
+      useLookedUp = true;
+      const src = r.provenance.boundary_source === "county-parcel"
+        ? "REAL parcel boundary" : "geocoded point (fallback square)";
+      $("lookup-status").textContent = "✓ " + r.matched_address + " — " + src
+        + (r.provenance.translated ? " · shown at the sim's location" : "");
+      if (map || r.home) {              // draw the proposal before any planning
+        initMap(r.home);
+        if (boundaryLayer) boundaryLayer.remove();
+        boundaryLayer = L.polygon(r.boundary.map(q => [q.lat, q.lon]),
+          { color: "#7c3aed", dashArray: "6 4", fill: false });
+        boundaryLayer.addTo(map);
+        map.fitBounds(boundaryLayer.getBounds().pad(0.2));
+      }
+    } catch (e) { $("lookup-status").textContent = "error: " + e.message; }
+    finally { $("lookup").disabled = false; }
+  };
+
   $("plan").onclick = async () => {
     $("plan-status").textContent = "planning…";
     $("plan").disabled = true;
     lastPlan = null;  // D12.1: a new attempt invalidates the reviewed plan
     try {
       const p = await api("/api/plan", "POST",
-        { request_text: $("intent").value || $("intent").placeholder, operator: OPERATOR });
+        { request_text: $("intent").value || $("intent").placeholder,
+          operator: OPERATOR, use_looked_up: useLookedUp });
       if (!p.ok && !p.steps) { lastPlan = null; $("plan-status").textContent = "planner failed: " + (p.detail || ""); return; }
       lastPlan = p;  // D12: APPROVE submits exactly this reviewed mission+hash
       $("plan-status").textContent = p.ok ? "validated — review and approve" : "validation FAILED — see checklist";

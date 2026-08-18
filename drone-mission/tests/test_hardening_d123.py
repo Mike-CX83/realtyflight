@@ -343,3 +343,40 @@ async def test_recovery_timeout_is_exposed_and_envelope_derived(good_plan):
     expected = 2.0 * lim.max_home_dist_m / max(lim.max_speed_ms, 0.5) \
         + lim.max_alt_m / 0.5 + 60.0
     assert abs(ex2.recovery_timeout_s - expected) < 1e-6
+
+
+# --------------------------------------------------------------------------- #
+# Post-loop live SITL finding (D12.4): the vehicle must FLY the approved speed
+# --------------------------------------------------------------------------- #
+
+
+async def test_goto_sets_autopilot_cruise_param():
+    """Field finding by the Mac agent, caught BY the D12.3 monitor on live
+    SITL: PX4 ignores set_current_speed for goto-style flight and cruised at
+    its ~5 m/s default over 3-4 m/s approvals (honest failsafes resulted).
+    goto() now sets the autopilot's MPC_XY_CRUISE parameter directly; the
+    monitor stays on as the enforcement backstop."""
+    b = _px4(command_wait_s=1.0)
+    _prime(b)
+    b._home_abs_alt = 100.0
+    params = []
+
+    class Param:
+        async def set_param_float(self, name, value):
+            params.append((name, value))
+
+    async def set_speed(v):
+        return None
+
+    async def goto_location(*a):
+        return None
+
+    b._system = SimpleNamespace(
+        action=SimpleNamespace(set_current_speed=set_speed, goto_location=goto_location),
+        param=Param(),
+    )
+    from core.schema import GeoPoint
+
+    target = GeoPoint(lat=_POS.latitude_deg, lon=_POS.longitude_deg)
+    await b.goto(target, 12.0, 3.5, None, idem="d124:cruise")
+    assert ("MPC_XY_CRUISE", 3.5) in params, "autopilot cruise param never set"
