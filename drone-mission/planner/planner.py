@@ -84,6 +84,11 @@ class MissionPlanner:
                     self._agent.run(prompt, message_history=history),
                     timeout=self._llm_timeout_s,
                 )
+                # D12.3: output extraction and history live INSIDE the
+                # boundary too — "the planner never raises" covers provider
+                # result-shape surprises, not just transport failures.
+                draft: PlanDraft = run.output
+                history = run.all_messages()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -93,8 +98,6 @@ class MissionPlanner:
                 return PlannerResult(
                     plan=plan, report=report, rounds=round_no + 1, transcript=transcript
                 )
-            draft: PlanDraft = run.output
-            history = run.all_messages()
             transcript.append(
                 f"DRAFT[{round_no}]: {len(draft.steps)} steps — {draft.summary[:120]}"
             )

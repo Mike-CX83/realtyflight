@@ -49,16 +49,25 @@ class EventLog:
         self._conn.commit()
 
     def append(self, mission_id: str, ts: float, type_: str, payload: dict[str, Any]) -> Event:
-        cur = self._conn.execute(
-            "SELECT COALESCE(MAX(seq), -1) + 1 FROM mission_events WHERE mission_id = ?",
-            (mission_id,),
-        )
-        seq = int(cur.fetchone()[0])
-        self._conn.execute(
-            "INSERT INTO mission_events (mission_id, seq, ts, type, payload) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (mission_id, seq, ts, type_, json.dumps(payload, sort_keys=True)),
-        )
+        # D12.3: two connections (server governance writer + executor) can race
+        # MAX(seq)+1 for the same mission — retry once on the PK collision so a
+        # concurrent governance event never silently drops a flight event.
+        for attempt in (0, 1):
+            cur = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), -1) + 1 FROM mission_events WHERE mission_id = ?",
+                (mission_id,),
+            )
+            seq = int(cur.fetchone()[0])
+            try:
+                self._conn.execute(
+                    "INSERT INTO mission_events (mission_id, seq, ts, type, payload) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (mission_id, seq, ts, type_, json.dumps(payload, sort_keys=True)),
+                )
+                break
+            except sqlite3.IntegrityError:
+                if attempt == 1:
+                    raise
         self._conn.commit()
         return Event(mission_id=mission_id, seq=seq, ts=ts, type=type_, payload=payload)
 

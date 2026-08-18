@@ -22,13 +22,14 @@ import contextlib
 import hmac
 import secrets
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import AfterValidator, BaseModel, Field, StringConstraints
 
 from core.approval import ApprovalError, ApprovalRecord, grant_approval
 from core.engine import MissionExecutor, MissionOutcome, MissionResult
@@ -50,14 +51,23 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
 # D12 (review C8): one normalized operator type everywhere — stripped, and
-# blank-after-strip is a 422. D12.1: control/format characters are refused
-# too — no invisible identities in the audit trail.
+# blank-after-strip is a 422. D12.1: ASCII control characters refused.
+# D12.3 (review #3): UNICODE invisibles too — zero-width spaces, bidi
+# overrides, C1 controls, any Cc/Cf category character. NFKC-normalized so
+# the audit trail records one canonical, visible identity.
+def _visible_operator(v: str) -> str:
+    v = unicodedata.normalize("NFKC", v).strip()
+    if not v or any(unicodedata.category(c) in ("Cc", "Cf") for c in v):
+        raise ValueError(
+            "operator must be a visible name (no control/format/invisible characters)"
+        )
+    return v
+
+
 Operator = Annotated[
     str,
-    StringConstraints(
-        strip_whitespace=True, min_length=1, max_length=120,
-        pattern=r"^[^\x00-\x1F\x7F]+$",
-    ),
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=120),
+    AfterValidator(_visible_operator),
 ]
 
 
@@ -160,8 +170,20 @@ def create_app(
         try:
             if sess.mission_active():
                 sess.executor.abort(operator="server-shutdown")
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(sess.mission_task, timeout=15.0)
+                # D12.3 (review #3): the grace period scales with the
+                # executor's own recovery budget, and asyncio.wait (unlike
+                # wait_for) NEVER cancels the recovery on timeout — shutdown
+                # must not kill a legitimate recovery flight mid-air.
+                grace = min(
+                    180.0,
+                    getattr(sess.executor, "recovery_timeout_s", 60.0) + 30.0,
+                )
+                done, _ = await asyncio.wait({sess.mission_task}, timeout=grace)
+                if not done:
+                    _audit(
+                        sess.executor.plan.mission_id, "shutdown.unresolved",
+                        why=f"mission still recovering after {grace:.0f}s grace",
+                    )
         except Exception:
             pass
         with contextlib.suppress(Exception):
@@ -210,7 +232,10 @@ def create_app(
     async def state_snapshot() -> dict:
         tel = await sess.backend.latest_telemetry()
         ex = sess.executor
-        plan = sess.pending_plan or (ex.plan if ex else None)
+        # D12.3 (review #3): mission fields describe THE MISSION (the
+        # executor's plan) — never a new pending plan's identity glued onto an
+        # old mission's progress. The plan card reads /api/plan's own response.
+        plan = (ex.plan if ex else None) or sess.pending_plan
         home = plan.property.home if plan else None
         return {
             "ts": time.time(),
@@ -328,7 +353,9 @@ def create_app(
         live_report = validate_plan(result.plan, await live_ctx())
         sess.pending_plan = result.plan
         sess.pending_report = live_report
-        sess.result = None
+        # (D12.3: sess.result is NOT cleared here — /api/state describes the
+        # executor's mission, including its outcome, until a new approval
+        # actually replaces it. Clearing on plan mixed two missions' states.)
         sess.planner_rounds = result.rounds
 
         # D12: the governance chain starts HERE, not at approval.
@@ -404,6 +431,7 @@ def create_app(
         Path(sess.log_path).parent.mkdir(parents=True, exist_ok=True)
         log = EventLog(sess.log_path)
         sess.approval = approval
+        sess.result = None  # the new mission owns the state from here (D12.3)
         sess.executor = MissionExecutor(
             sess.pending_plan, approval, sess.backend, log,
             clock=time.time, profile="sim", breaker=sess.breaker,
@@ -529,6 +557,12 @@ def create_app(
                 await sock.send_json(await state_snapshot())
                 await asyncio.sleep(1.0)
         except WebSocketDisconnect:
+            return
+        except Exception:
+            # D12.3: a transient backend/state error must not tear the socket
+            # down with a stack trace — close quietly; the page reconnects.
+            with contextlib.suppress(Exception):
+                await sock.close(code=1011)
             return
 
     return app

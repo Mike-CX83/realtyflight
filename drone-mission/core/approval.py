@@ -109,6 +109,20 @@ def grant_approval(
             f"Cannot approve: report never ran required rules {sorted(missing)}. "
             "A rule that didn't run is a rule that didn't pass."
         )
+    # D12.3 (review #3): the supplied report's STATIC verdict is not trusted —
+    # the engine re-runs the pure rules right here. A fabricated all-pass
+    # report with a correct hash and full manifest dies on physics (their
+    # probe: a 100 m takeoff against a 40 m limit was approved). The live
+    # tier still relies on the supplied report; making that unforgeable needs
+    # an approval-service boundary (ledger: G5/real-flight work).
+    from core.policy.engine import validate_plan
+
+    static = validate_plan(plan)
+    if not static.ok:
+        raise ApprovalError(
+            f"Cannot approve: static re-validation failed {static.failed_rules()} "
+            "— the supplied report claimed these passed."
+        )
 
     real_confirmed = False
     if profile == "real":

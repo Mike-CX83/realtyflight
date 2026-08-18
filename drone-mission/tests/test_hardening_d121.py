@@ -190,6 +190,10 @@ async def test_kill_while_paused_wakes_and_freezes(good_plan):
         await asyncio.sleep(0.005)
         if ex.machine.current_state.id == "paused":
             break
+    # D12.2 tightening (independent-verification finding): the kill must be
+    # tested FROM the paused state — without this assert, a broken hold would
+    # let the test pass via the ordinary kill-from-executing path.
+    assert ex.machine.current_state.id == "paused", "never reached paused"
 
     cut = len(backend.command_log)
     ex.kill(reason="kill while paused", operator="mike")
@@ -256,6 +260,9 @@ async def test_mission_closed_records_outcome_and_reason(good_plan):
     assert result.outcome == MissionOutcome.COMPLETED
     closed = [e for e in log.replay(good_plan.mission_id) if e.type == "mission.closed"]
     assert closed and closed[-1].payload.get("outcome") == "completed"
+    # D12.2 tightening: reason is ALWAYS present (may be empty on success) —
+    # a replay alone must carry the full verdict for every outcome.
+    assert "reason" in closed[-1].payload
 
 
 # --------------------------------------------------------------------------- #
@@ -278,9 +285,12 @@ def _prime(b: PX4Backend, *, speed: float = 0.0) -> None:
         b._cache[key] = (val, now)
 
 
-async def test_gimbal_ambiguous_retry_does_not_resend():
-    """Rerun probe: gimbal_sends_same_key 2. Accepted-but-cancelled gimbal
-    work must reconcile on retry, not re-send."""
+async def test_gimbal_ambiguous_retry_resends_until_accepted():
+    """Doctrine refined by review #3: a gimbal attempt cancelled while the SDK
+    call was still IN FLIGHT is ambiguous — the retry RE-SENDS (aiming is
+    idempotent; the danger is marking done with zero angle commands, which is
+    exactly what review #3's probe caught). Only a fully ACCEPTED attempt
+    (SDK calls returned) reconciles without re-sending."""
     b = _px4()
     _prime(b)
     sends = {"n": 0}
@@ -291,7 +301,8 @@ async def test_gimbal_ambiguous_retry_does_not_resend():
             sends["n"] += 1
 
         async def set_angles(self, *a):
-            await hang.wait()                          # accepted, never completes
+            if sends["n"] == 1:
+                await hang.wait()                      # first attempt: ambiguous
 
     b._system = SimpleNamespace(gimbal=Gimbal(), action=None)
     task = asyncio.ensure_future(b.set_gimbal_pitch(-20.0, idem="d121:g"))
@@ -303,14 +314,37 @@ async def test_gimbal_ambiguous_retry_does_not_resend():
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    # executor retry, same key — must reconcile instantly, never re-send
-    retry = asyncio.ensure_future(b.set_gimbal_pitch(-20.0, idem="d121:g"))
-    done, _ = await asyncio.wait({retry}, timeout=1.0)
-    if not done:                                       # pre-fix: re-sent and hung
-        retry.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await retry
-    assert sends["n"] == 1, "ambiguous gimbal retry re-sent the SDK command"
+    # executor retry, same key — ambiguous first attempt means RE-SEND...
+    await asyncio.wait_for(b.set_gimbal_pitch(-20.0, idem="d121:g"), timeout=1.0)
+    assert sends["n"] == 2, "ambiguous gimbal attempt must be re-sent"
+    # ...and a THIRD call with the completed key is a pure no-op.
+    await asyncio.wait_for(b.set_gimbal_pitch(-20.0, idem="d121:g"), timeout=1.0)
+    assert sends["n"] == 2, "completed gimbal key must never re-send"
+
+
+async def test_connect_wait_returns_once_critical_streams_complete():
+    """D12.2 (found live by the Mac agent, 3/12 contract tests): fail-closed
+    telemetry means connect() must WAIT for the first complete snapshot —
+    'connected' has to mean 'I can answer basic state questions'."""
+    b = _px4()
+
+    async def feed():
+        await asyncio.sleep(0.15)
+        _prime(b)                                      # streams arrive late
+
+    feeder = asyncio.ensure_future(feed())
+    await asyncio.wait_for(b._await_first_snapshot(2.0), timeout=3.0)
+    await feeder
+    assert await b.latest_telemetry() is not None
+
+
+async def test_connect_wait_fails_closed_naming_missing_streams():
+    from core.interfaces import BackendUnavailable
+
+    b = _px4()                                         # streams never arrive
+    with pytest.raises(BackendUnavailable) as exc:
+        await b._await_first_snapshot(0.3)
+    assert "in_air" in str(exc.value)                  # says WHICH streams
 
 
 async def test_speed_hard_cap_is_always_on_and_tight():

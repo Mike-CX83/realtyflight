@@ -89,7 +89,12 @@ class ExecutorTuning:
 
     timeout_factor: float = 2.0
     timeout_floor_s: float = 10.0
-    recovery_cmd_timeout_s: float = 120.0  # watchdog per recovery command (RTL/land)
+    # Watchdog per recovery command (RTL/land). None (default) = derived from
+    # the mission envelope at executor init — worst legal RTL leg + a full
+    # descent + slack — so the description "envelope-derived" is true for
+    # recovery too (D12.2, independent-verification finding). Set explicitly
+    # to override (tests use tiny values).
+    recovery_cmd_timeout_s: float | None = None
 
 
 @dataclass
@@ -131,6 +136,12 @@ class MissionExecutor:
         self._current_task: asyncio.Task | None = None
         self._steps_completed = 0
         self._audit_failures: list[tuple[str, str]] = []  # events the log refused
+        lim = plan.limits
+        self._recovery_timeout_s: float = self.tuning.recovery_cmd_timeout_s or (
+            2.0 * lim.max_home_dist_m / max(lim.max_speed_ms, 0.5)
+            + lim.max_alt_m / 0.5
+            + 60.0
+        )
 
     # ------------------------------------------------------------------ hooks
 
@@ -161,22 +172,48 @@ class MissionExecutor:
         self._preempt_current()
         self._record_safe("breaker.kill", reason=reason, operator=operator)
 
-    def hold(self, *, operator: str | None = None) -> None:
-        """Operator hold. D12.1 (rerun): PREEMPTIVE — cancels the in-flight
-        step instead of waiting for it to finish; the drone freezes and pauses
-        NOW. Resume re-dispatches the same step on the same idempotency key,
-        which is exactly what the keys exist for."""
-        self._hold_requested.set()
-        self._preempt_current()
-        self._record_safe("hold.requested", operator=operator)
+    def hold(self, *, operator: str | None = None) -> bool:
+        """Operator hold. D12.1: PREEMPTIVE — cancels the in-flight step; the
+        drone freezes and pauses NOW; resume re-dispatches the same step on
+        the same idempotency key.
 
-    def resume(self, *, operator: str | None = None) -> None:
-        self._resume_requested.set()
-        self._record_safe("resume.requested", operator=operator)
+        D12.3 (review #3): STATE-AWARE. Recovery is NOT holdable — a hold
+        during aborting/returning/landing must never cancel the recovery
+        command (the review's probe killed the mission task airborne that
+        way). It is recorded hold.ignored and refused."""
+        sid = self.machine.current_state.id
+        if sid == "executing":
+            self._hold_requested.set()
+            self._preempt_current()
+            self._record_safe("hold.requested", operator=operator)
+            return True
+        if sid == "paused":
+            self._record_safe("hold.requested", operator=operator, note="already paused")
+            return True
+        self._record_safe("hold.ignored", operator=operator, state=sid,
+                          why="recovery/landing phases are not holdable")
+        return False
+
+    def resume(self, *, operator: str | None = None) -> bool:
+        """D12.3: RESUME is only meaningful while paused — setting it early
+        used to sit stale and instantly un-pause the NEXT hold."""
+        if self.machine.current_state.id == "paused":
+            self._resume_requested.set()
+            self._record_safe("resume.requested", operator=operator)
+            return True
+        self._record_safe("resume.ignored", operator=operator,
+                          state=self.machine.current_state.id)
+        return False
 
     @property
     def steps_completed(self) -> int:
         return self._steps_completed
+
+    @property
+    def recovery_timeout_s(self) -> float:
+        """The per-recovery-command watchdog budget (envelope-derived unless
+        tuned). The server's shutdown grace scales from this (D12.3)."""
+        return self._recovery_timeout_s
 
     def _preempt_current(self) -> None:
         if self._current_task is not None and not self._current_task.done():
@@ -289,14 +326,15 @@ class MissionExecutor:
         finally:
             # D12.1 (rerun): the closing event carries the VERDICT, not just
             # counters — a replay alone must tell you how the mission ended.
-            self._record_safe(
-                "mission.closed",
-                state=self.machine.current_state.id,
-                outcome=(res.outcome.value if res else None),
-                reason=(res.reason if res and res.reason else None),
-                steps_completed=self._steps_completed,
-                media_count=len(self.media),
-            )
+            closed: dict = {
+                "state": self.machine.current_state.id,
+                "steps_completed": self._steps_completed,
+                "media_count": len(self.media),
+            }
+            if res is not None:  # D12.2: outcome AND reason always present
+                closed["outcome"] = res.outcome.value  # (reason may be "",
+                closed["reason"] = res.reason          # never missing)
+            self._record_safe("mission.closed", **closed)
 
     async def _run_governed(self) -> MissionResult:
         m = self.machine
@@ -315,7 +353,31 @@ class MissionExecutor:
                 reason=f"preflight gate: {denied}",
             )
 
-        pre = await self.backend.preflight()
+        # D12.3 (review #3): preflight runs BOUNDED and in the preemptible
+        # slot — a hung backend preflight used to be un-abortable forever.
+        try:
+            pre = await self._bounded_cmd(
+                self.backend.preflight(), "preflight",
+                budget_s=min(60.0, self._recovery_timeout_s),
+            )
+        except asyncio.CancelledError:
+            if self._abort_requested.is_set() or self._kill_requested.is_set():
+                m.start_execution()
+                m.fail()
+                return MissionResult(
+                    outcome=MissionOutcome.REJECTED_AT_GATE,
+                    final_state=m.current_state.id,
+                    reason="aborted during preflight",
+                )
+            raise
+        except BackendError as exc:
+            m.start_execution()
+            m.fail()
+            return MissionResult(
+                outcome=MissionOutcome.REJECTED_AT_GATE,
+                final_state=m.current_state.id,
+                reason=f"preflight failed: {type(exc).__name__}: {exc}",
+            )
         self.rec.record("preflight.report", ok=pre.ok, items=[i.model_dump() for i in pre.items])
         if not pre.ok:
             m.start_execution()
@@ -370,8 +432,23 @@ class MissionExecutor:
                 )
             if self._hold_requested.is_set():
                 m.step_hold()
-                await self.backend.hold()
                 self._hold_requested.clear()
+                self._resume_requested.clear()   # D12.3: a stale early RESUME
+                try:                             # must not instantly un-pause
+                    # D12.3: the hold command itself runs BOUNDED in the
+                    # preemptible slot — a hung backend.hold() used to be
+                    # un-abortable forever.
+                    await self._bounded_cmd(self.backend.hold(), "hold")
+                except asyncio.CancelledError:
+                    if self._kill_requested.is_set():
+                        return await self._failsafe_recovery(
+                            i, f"circuit breaker open ({self.breaker.open_reason})"
+                        )
+                    return await self._recover_abort(i)
+                except BackendError as exc:
+                    return await self._failsafe_recovery(
+                        i, f"hold command failed: {type(exc).__name__}: {exc}"
+                    )
                 await self._wait_resume()
                 if self._abort_requested.is_set():
                     return await self._recover_abort(i)
@@ -728,8 +805,19 @@ class MissionExecutor:
                 )
                 await self._freeze()
                 return
+            if self._hold_requested.is_set() and not self._abort_requested.is_set():
+                # D12.3 (review #3 probe): a HOLD racing into recovery must
+                # never kill the mission task airborne. Recovery is not
+                # holdable: refuse it, freeze, and end unresolved-honest.
+                self._hold_requested.clear()
+                self._record_safe("hold.ignored", why="recovery is not holdable")
+                await self._freeze()
+                return
             if self._abort_requested.is_set():
+                # D12.3: a second ABORT during recovery re-freezes before
+                # standing down — never leave prior motion running unwatched.
                 self._record_safe("recovery.interrupted", why="abort during recovery")
+                await self._freeze()
                 return
             raise  # the mission task itself is being torn down
         except Exception as exc:
@@ -753,34 +841,36 @@ class MissionExecutor:
         try:
             await asyncio.wait_for(
                 self.backend.abort_motion(),
-                timeout=min(10.0, self.tuning.recovery_cmd_timeout_s),
+                timeout=min(10.0, self._recovery_timeout_s),
             )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             self._record_safe("freeze.unconfirmed", error=repr(exc))
 
-    async def _bounded_recovery_cmd(self, coro, what: str) -> None:
-        """A recovery command with its own watchdog (D12): a hung RTL/land can
-        no longer strand the mission airborne in 'returning' forever. D12.1:
-        it runs in the SAME preemptible slot as ordinary commands, so kill()
-        and abort() can cancel recovery mid-flight too."""
+    async def _bounded_cmd(self, coro, what: str, *, budget_s: float | None = None):
+        """A backend command with its own watchdog, running in the PREEMPTIBLE
+        slot (D12/D12.1/D12.3): a hung RTL/land/hold/preflight can no longer
+        strand the mission, and kill()/abort() can cancel it mid-flight.
+        Returns the command's result."""
+        budget = budget_s if budget_s is not None else self._recovery_timeout_s
         task = asyncio.ensure_future(coro)
         self._current_task = task
         try:
-            await asyncio.wait_for(
-                asyncio.shield(task), timeout=self.tuning.recovery_cmd_timeout_s
-            )
+            return await asyncio.wait_for(asyncio.shield(task), timeout=budget)
         except TimeoutError:
             task.cancel()
             with contextlib.suppress(BaseException):
                 await task
             raise CommandTimeout(
-                f"recovery command timed out: {what} "
-                f"(> {self.tuning.recovery_cmd_timeout_s:.0f}s)"
+                f"command timed out: {what} (> {budget:.0f}s)"
             ) from None
         finally:
             self._current_task = None
+
+    # Backwards-compatible alias (recovery paths read better with this name).
+    async def _bounded_recovery_cmd(self, coro, what: str) -> None:
+        await self._bounded_cmd(coro, what)
 
     async def _crash_terminal(self, exc: Exception) -> MissionResult:
         """The last wall (D12, review C7): an untyped failure is recorded,

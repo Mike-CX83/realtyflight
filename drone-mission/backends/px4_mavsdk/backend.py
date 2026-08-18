@@ -22,6 +22,7 @@ this module; connect() raises BackendUnavailable with instructions instead.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
@@ -57,6 +58,7 @@ class PX4Config:
     arrive_tolerance_m: float = 2.5
     alt_tolerance_m: float = 1.5
     command_wait_s: float = 120.0                   # per-motion evidence wait ceiling
+    connect_telemetry_wait_s: float = 30.0          # connect() waits for 1st full snapshot
 
 
 class PX4Backend:
@@ -104,6 +106,22 @@ class PX4Backend:
             ) from exc
 
         self._system = System()
+        # D12.3 (review #3): ONE bounded connection sequence with cleanup —
+        # a hung autopilot/home/telemetry wait must never leak cacher tasks
+        # or the mavsdk_server subprocess, and the deadline is MONOTONIC wall
+        # time (a frozen injected clock must not make it infinite).
+        try:
+            await asyncio.wait_for(
+                self._connect_sequence(System),
+                timeout=self.cfg.connect_telemetry_wait_s + 60.0,
+            )
+        except BaseException as exc:
+            await self._teardown()
+            if isinstance(exc, (asyncio.CancelledError, BackendUnavailable)):
+                raise
+            raise BackendUnavailable(f"PX4 connect failed: {exc}") from exc
+
+    async def _connect_sequence(self, System) -> None:  # noqa: N803
         await self._system.connect(system_address=self.cfg.system_address)
 
         # wait for the autopilot to appear
@@ -131,9 +149,41 @@ class PX4Backend:
             self._home = GeoPoint(lat=home.latitude_deg, lon=home.longitude_deg)
             break
 
+        # D12.2: "connected" MEANS "I can answer basic state questions."
+        # Fail-closed telemetry (D12) returns None until EVERY critical stream
+        # has reported — so connect() waits (bounded) for the first complete
+        # snapshot instead of making every caller learn the first-telemetry
+        # dance. The contract suite's line 'backend must produce telemetry
+        # after connect' becomes a guarantee, not an assumption. (Found by the
+        # Mac agent: 3/12 contract tests raced this exact window.)
+        await self._await_first_snapshot(self.cfg.connect_telemetry_wait_s)
+
+    async def _await_first_snapshot(self, timeout_s: float) -> None:
+        import time as _time
+
+        deadline = _time.monotonic() + timeout_s  # monotonic: real waiting is
+        while True:                               # wall time, whatever the
+            if await self.latest_telemetry() is not None:  # injected clock does
+                return
+            if _time.monotonic() > deadline:
+                critical = ("position", "velocity", "in_air", "armed")
+                missing = [k for k in critical if k not in self._cache]
+                raise BackendUnavailable(
+                    f"connected, but no complete telemetry within {timeout_s:.0f}s "
+                    f"(critical streams still missing: {missing}) — refusing to "
+                    "report a backend as ready when the aircraft's state is unknown"
+                )
+            await asyncio.sleep(POLL_S)
+
     async def disconnect(self) -> None:
+        await self._teardown()
+
+    async def _teardown(self) -> None:
         for task in self._tasks:
             task.cancel()
+        if self._tasks:  # D12.3: AWAIT the cancelled cachers — no orphans
+            with contextlib.suppress(Exception):
+                await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks = []
         if self._system is not None:
             # mavsdk spawns a bundled mavsdk_server subprocess per System() that
@@ -189,11 +239,19 @@ class PX4Backend:
         critical = ("position", "velocity", "in_air", "armed")
         if any(k not in self._cache for k in critical):
             return None
+        # D12.3 (review #3): a SINGLE future-dated critical field must not
+        # hide behind min() while another field carries the current time —
+        # any impossible timestamp means the whole state is untrustworthy.
+        if any(self._cache[k][1] > now + 0.5 for k in critical):
+            return None
         snapshot_ts = min(self._cache[k][1] for k in critical)
 
         def _aux_fresh(key: str) -> bool:
             item = self._cache.get(key)
-            return bool(item and (now - item[1]) <= AUX_STALE_S)
+            if not item:
+                return False
+            age = now - item[1]
+            return 0.0 <= age <= AUX_STALE_S  # future-dated aux = unknown (D12.3)
 
         speed = 0.0
         vspeed = 0.0
@@ -341,9 +399,19 @@ class PX4Backend:
                 strikes = 0
             return None
 
+        def arrived(t: TelemetrySnapshot) -> bool:
+            # D12.3 (review #3): arrival is REFUSED while overspeeding — the
+            # probe arrived inside tolerance at 6.1 m/s on a 5 m/s approval
+            # and 'won' before the 3-strike debounce could trip.
+            if strikes > 0:
+                return False
+            return (
+                distance_m(t.position, p) <= self.cfg.arrive_tolerance_m
+                and abs(t.alt_rel_m - alt_m) <= self.cfg.alt_tolerance_m
+            )
+
         await self._wait(
-            lambda t: distance_m(t.position, p) <= self.cfg.arrive_tolerance_m
-            and abs(t.alt_rel_m - alt_m) <= self.cfg.alt_tolerance_m,
+            arrived,
             f"goto ({p.lat:.6f},{p.lon:.6f}) @ {alt_m} m",
             fail=overspeed,
         )
@@ -355,13 +423,15 @@ class PX4Backend:
             return
         self._require_connected()
         if idem in self._inflight:
-            # D12.1 (rerun C4): the SDK command was already accepted on an
+            # D12.1 (rerun C4): the SDK command was already ACCEPTED on an
             # earlier attempt that never confirmed — gimbal aiming is
             # idempotent by nature, so reconcile (mark done), never re-send.
             self._done(idem)
             self._inflight.discard(idem)
             return
-        self._inflight.add(idem)
+        # D12.3 (review #3): the in-flight marker lands only AFTER the SDK
+        # calls return (= accepted). Marking before meant a cancel before
+        # acceptance turned the retry into a silent no-op (angle_commands=0).
         g = self._system.gimbal
         try:
             # MAVSDK v3 signature (gimbal_id, ...); fall back to older v2 shapes.
@@ -373,6 +443,7 @@ class PX4Backend:
             except TypeError:
                 await g.take_control(ControlMode.PRIMARY)          # v2
                 await g.set_pitch_and_yaw(pitch_deg, 0.0)           # v2
+            self._inflight.add(idem)  # accepted NOW — not before (D12.3)
         except Exception as exc:
             if self.cfg.is_physical:
                 # D12 (review): a physical shoot must never silently lose its
@@ -464,8 +535,9 @@ class PX4Backend:
                         frame = f
                 if frame is None:
                     return False
-                cv2.imwrite(str(out), frame)
-                return True
+                # D12.3 (review #3): imwrite reports failure via its RETURN
+                # value — ignoring it turned a full disk into a fake photo.
+                return bool(cv2.imwrite(str(out), frame))
             finally:
                 cap.release()
         except Exception:
@@ -525,14 +597,18 @@ class PX4Backend:
         self._inflight.discard(idem)
 
     async def abort_motion(self) -> None:
-        """Stop moving NOW: PX4 Hold mode freezes the aircraft in place."""
+        """Stop moving NOW: PX4 Hold mode freezes the aircraft in place.
+
+        D12.3 (review #3): a REJECTED freeze raises typed — the executor's
+        `_freeze()` catches it and records `freeze.unconfirmed` in the MISSION
+        audit. Swallowing it here meant a kill could report a freeze-only
+        stand-down while the aircraft kept flying its previous motion."""
         self._require_connected()
         try:
             await self._system.action.hold()
         except Exception as exc:
-            # abort must never raise (executor proceeds to recovery regardless)
-            # — but the failure is RECORDED, not swallowed (D12.1 rerun note).
             self._note_media_event("abort_motion_failed", {"error": str(exc)})
+            raise CommandRejected(f"freeze (hold) rejected: {exc}") from exc
 
     async def fetch_media(self, ref: MediaRef) -> str:
         return ref.path or ""

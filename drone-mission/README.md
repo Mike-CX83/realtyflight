@@ -40,7 +40,7 @@ pip install -e ".[dev]"                               # or: uv pip install -e ".
 pytest -q
 ```
 
-Expected: `230 passed, 6 skipped` (the skips are PX4 contract tests awaiting a live SITL —
+Expected: `246 passed, 6 skipped` (the skips are PX4 contract tests awaiting a live SITL —
 start `docker run --rm -it jonasvautherin/px4-gazebo-headless:1.17.0` and run
 `RUN_PX4_CONTRACT=1 pytest tests/test_backend_contract.py -q` to un-skip them). (A handful of python-statemachine `current_state` deprecation
 warnings are known-cosmetic.) The fun ones are the evil suites across `tests/test_rules_wave*.py` —
