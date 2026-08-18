@@ -23,7 +23,17 @@ from dataclasses import dataclass
 from core.geo import distance_m
 from core.interfaces import BackendCapabilities, TelemetrySnapshot
 from core.policy.types import Violation
-from core.schema import CapturePhoto, Goto, Hold, MissionPlan, Orbit, SetGimbal, Takeoff
+from core.schema import (
+    CapturePhoto,
+    GeoPoint,
+    Goto,
+    Hold,
+    MissionPlan,
+    Orbit,
+    SetGimbal,
+    Takeoff,
+    orbit_capture_count,
+)
 
 # Conservative motion model constants for the endurance estimate (PWR-02).
 CLIMB_RATE_MS = 1.5
@@ -76,10 +86,22 @@ def estimate_mission_duration_s(plan: MissionPlan) -> float:
             t += abs(step.alt_m - alt) / (CLIMB_RATE_MS if step.alt_m > alt else DESCENT_RATE_MS)
             arc_len = 2.0 * math.pi * step.radius_m * (step.arc_deg / 360.0)
             t += arc_len / step.speed_ms
-            if step.captures_every_deg is not None:
-                n = max(1, int(step.arc_deg // step.captures_every_deg))
-                t += n * CAPTURE_DWELL_S
-            pos, alt = step.center, step.alt_m  # ends near the ring; center is close enough
+            if step.captures_every_deg is not None and step.capture is not None:
+                # D12 (review): budget the SAME capture count the executor
+                # flies — int(arc//every) under-counted partial orbits vs the
+                # shared orbit_capture_count() source of truth.
+                t += orbit_capture_count(step.arc_deg, step.captures_every_deg) * CAPTURE_DWELL_S
+            # D12 (review): end at the actual ring EXIT point, not the center —
+            # center-as-exit shaved meters off the next leg's budget.
+            exit_rad = math.radians(step.arc_deg if step.direction == "cw" else -step.arc_deg)
+            exit_e = step.radius_m * math.sin(exit_rad)
+            exit_n = step.radius_m * math.cos(exit_rad)
+            pos = GeoPoint(
+                lat=step.center.lat + exit_n / 111_195.0,
+                lon=step.center.lon
+                + exit_e / (111_195.0 * math.cos(math.radians(step.center.lat))),
+            )
+            alt = step.alt_m
         elif isinstance(step, SetGimbal):
             t += GIMBAL_MOVE_S
         elif isinstance(step, CapturePhoto):

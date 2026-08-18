@@ -126,8 +126,7 @@ async def test_exterior_package_flies_on_fake_backend():
     assert report.ok
     approval = grant_approval(plan, report, operator="mike", now_ts=time.time())
     ex = MissionExecutor(plan, approval, backend, log, clock=clock, profile="sim",
-                         tuning=ExecutorTuning(timeout_factor=2.0, timeout_floor_s=0.25,
-                                               poll_interval_s=0.005))
+                         tuning=ExecutorTuning(timeout_factor=2.0, timeout_floor_s=0.25))
     result = await ex.run()
 
     assert result.outcome == MissionOutcome.COMPLETED

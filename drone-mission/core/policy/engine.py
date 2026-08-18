@@ -26,7 +26,7 @@ from pydantic import ValidationError
 from core.policy import rules_wave1, rules_wave2, rules_wave3, rules_wave4
 from core.policy.rules_wave4 import ValidationContext
 from core.policy.types import RuleResult, ValidationReport, Violation
-from core.schema import MissionPlan
+from core.schema import MissionPlan, compute_plan_hash
 
 Rule = Callable[[MissionPlan], list[Violation]]
 LiveRule = Callable[[MissionPlan, ValidationContext], list[Violation]]
@@ -95,7 +95,21 @@ def validate_plan(plan: MissionPlan, ctx: ValidationContext | None = None) -> Va
                     violations=violations,
                 )
             )
-    return ValidationReport(results=results, schema_ok=True, live_checked=ctx is not None)
+    return ValidationReport(
+        results=results,
+        schema_ok=True,
+        live_checked=ctx is not None,
+        plan_hash=compute_plan_hash(plan),  # D12: bind the report to THIS plan
+    )
+
+
+def required_rule_ids(*, live: bool) -> set[str]:
+    """The rule manifest a report must cover to authorize anything (D12):
+    every registered static rule, plus every live rule when live=True."""
+    ids = {rule_id for rule_id, _, _ in RULES}
+    if live:
+        ids |= {rule_id for rule_id, _, _ in LIVE_RULES}
+    return ids
 
 
 def parse_and_validate(

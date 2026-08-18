@@ -62,6 +62,20 @@ class EventLog:
         self._conn.commit()
         return Event(mission_id=mission_id, seq=seq, ts=ts, type=type_, payload=payload)
 
+    def list_missions(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Read-side aggregate (D12): missions newest-first with event counts.
+        Exists so callers never reach into the private connection — the log's
+        public API stays append + read, nothing else."""
+        cur = self._conn.execute(
+            "SELECT mission_id, COUNT(*), MIN(ts), MAX(ts) FROM mission_events "
+            "GROUP BY mission_id ORDER BY MAX(ts) DESC LIMIT ?",
+            (int(limit),),
+        )
+        return [
+            {"mission_id": m, "events": n, "started_ts": t0, "ended_ts": t1}
+            for (m, n, t0, t1) in cur.fetchall()
+        ]
+
     def replay(self, mission_id: str) -> list[Event]:
         cur = self._conn.execute(
             "SELECT mission_id, seq, ts, type, payload FROM mission_events "

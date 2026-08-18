@@ -39,6 +39,11 @@ class ValidationReport(BaseModel):
     live_checked: bool = False  # True => Wave-4 live-state rules ran with real context.
     # Approval (Wave 5 / APR-01) requires ok AND live_checked — a static-only
     # report can never authorize a flight.
+    plan_hash: str = ""  # D12: the canonical hash of the EXACT plan this report
+    # judged, stamped by the validation engine. Approval refuses any report
+    # whose hash doesn't match the plan being approved — a report is PROOF
+    # about one specific plan, not a transferable pass (review C3: an empty
+    # forged report was vacuously 'ok' and approved a violating plan).
 
     @property
     def ok(self) -> bool:

@@ -183,6 +183,7 @@ class FakeBackend:
         return MediaRef(media_id=media_id, tag=spec.tag, ts=self.clock())
 
     async def hold(self) -> None:
+        self.command_log.append(("hold", "-"))
         self.speed_ms = 0.0
 
     async def return_home(self, *, idem: str) -> None:

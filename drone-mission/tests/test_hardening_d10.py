@@ -151,8 +151,10 @@ async def test_hold_actually_holds_for_its_duration():
     elapsed = time.monotonic() - t0
     assert result.outcome == MissionOutcome.COMPLETED
     assert elapsed >= 0.4, f"a 0.4 s hold completed in {elapsed:.3f} s — it did not hold"
-    # and the backend was told to hold position
-    assert any(a == "hold" for a, _ in getattr(backend, "command_log", [])) or True
+    # and the backend was told to hold position (D12: the old assert ended in
+    # `or True` — vacuous, caught by the 2026-08-16 external review; FakeBackend
+    # now logs hold() so this asserts for real)
+    assert any(a == "hold" for a, _ in backend.command_log), "backend never told to hold"
 
 
 async def test_abort_during_hold_interrupts_immediately():

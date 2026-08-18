@@ -64,7 +64,10 @@ def test_every_mutating_route_requires_the_token(tmp_path):
     with dash(tmp_path) as (client, _):
         assert client.post("/api/plan",
                            json={"request_text": "x", "operator": "m"}).status_code == 401
-        assert client.post("/api/approve", json={"operator": "m"}).status_code == 401
+        assert client.post(
+            "/api/approve",
+            json={"operator": "m", "mission_id": "X", "plan_hash": "0" * 16},
+        ).status_code == 401
         assert client.post("/api/abort", json={"operator": "m"}).status_code == 401
         assert client.post("/api/breaker",
                            json={"operator": "m", "action": "trip"}).status_code == 401
@@ -75,7 +78,11 @@ def test_every_mutating_route_requires_the_token(tmp_path):
 
 def test_operator_name_is_required_on_approval(tmp_path):
     with dash(tmp_path) as (client, _):
-        r = client.post("/api/approve", json={"operator": ""}, headers=auth())
+        r = client.post(
+            "/api/approve",
+            json={"operator": "", "mission_id": "X", "plan_hash": "0" * 16},
+            headers=auth(),
+        )
         assert r.status_code == 422  # pydantic body validation: no anonymous approve
 
 
@@ -97,8 +104,13 @@ def test_plan_approve_fly_replay_full_flow(tmp_path):
         assert len(p["boundary"]) >= 3 and p["plan_hash"]
         mission_id = p["mission_id"]
 
-        # 2) approve -> mission starts
-        r = client.post("/api/approve", json={"operator": "mike"}, headers=auth())
+        # 2) approve -> mission starts (D12: approving THIS reviewed plan)
+        r = client.post(
+            "/api/approve",
+            json={"operator": "mike", "mission_id": p["mission_id"],
+                  "plan_hash": p["plan_hash"]},
+            headers=auth(),
+        )
         assert r.status_code == 200
         assert r.json()["approved"] is True and r.json()["operator"] == "mike"
 
@@ -123,7 +135,11 @@ def test_plan_approve_fly_replay_full_flow(tmp_path):
 
 def test_approve_without_plan_conflicts(tmp_path):
     with dash(tmp_path) as (client, _):
-        r = client.post("/api/approve", json={"operator": "mike"}, headers=auth())
+        r = client.post(
+            "/api/approve",
+            json={"operator": "mike", "mission_id": "X", "plan_hash": "0" * 16},
+            headers=auth(),
+        )
         assert r.status_code == 409
 
 
@@ -131,13 +147,19 @@ def test_breaker_trip_means_an_approved_mission_never_dispatches(tmp_path):
     with dash(tmp_path) as (client, backend):
         r = client.post("/api/plan", headers=auth(),
                         json={"request_text": "package", "operator": "mike"})
-        assert r.json()["ok"] is True
+        p = r.json()
+        assert p["ok"] is True
 
         r = client.post("/api/breaker", headers=auth(),
                         json={"operator": "mike", "action": "trip", "reason": "range officer"})
         assert r.json()["breaker_open"] is True
 
-        r = client.post("/api/approve", json={"operator": "mike"}, headers=auth())
+        r = client.post(
+            "/api/approve",
+            json={"operator": "mike", "mission_id": p["mission_id"],
+                  "plan_hash": p["plan_hash"]},
+            headers=auth(),
+        )
         assert r.status_code == 200  # approval granted...
 
         s = wait_state(client, lambda s: s["outcome"])
@@ -151,9 +173,15 @@ def test_breaker_trip_means_an_approved_mission_never_dispatches(tmp_path):
 
 def test_abort_over_http_preempts_a_flying_mission(tmp_path):
     with dash(tmp_path, hooks={("goto", 0): "hang"}) as (client, backend):
-        client.post("/api/plan", headers=auth(),
-                    json={"request_text": "package", "operator": "mike"})
-        client.post("/api/approve", json={"operator": "mike"}, headers=auth())
+        r = client.post("/api/plan", headers=auth(),
+                        json={"request_text": "package", "operator": "mike"})
+        p = r.json()
+        client.post(
+            "/api/approve",
+            json={"operator": "mike", "mission_id": p["mission_id"],
+                  "plan_hash": p["plan_hash"]},
+            headers=auth(),
+        )
 
         # airborne with the goto hung
         wait_state(client, lambda s: s["mission_active"] and s["steps_completed"] >= 1)

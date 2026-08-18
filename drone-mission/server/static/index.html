@@ -140,7 +140,7 @@
 
 <script>
 (() => {
-  let TOKEN = "", OPERATOR = "", ws = null, map = null, drone = null, trail = null,
+  let TOKEN = "", OPERATOR = "", lastPlan = null, ws = null, map = null, drone = null, trail = null,
       boundaryLayer = null, breakerOpen = false;
 
   const $ = id => document.getElementById(id);
@@ -234,7 +234,8 @@
     try {
       const p = await api("/api/plan", "POST",
         { request_text: $("intent").value || $("intent").placeholder, operator: OPERATOR });
-      if (!p.ok && !p.steps) { $("plan-status").textContent = "planner failed: " + (p.detail || ""); return; }
+      if (!p.ok && !p.steps) { lastPlan = null; $("plan-status").textContent = "planner failed: " + (p.detail || ""); return; }
+      lastPlan = p;  // D12: APPROVE submits exactly this reviewed mission+hash
       $("plan-status").textContent = p.ok ? "validated — review and approve" : "validation FAILED — see checklist";
       renderPlan(p);
     } catch (e) { $("plan-status").textContent = "error: " + e.message; }
@@ -243,7 +244,13 @@
 
   $("approve").onclick = async () => {
     try {
-      await api("/api/approve", "POST", { operator: OPERATOR });
+      if (!lastPlan) return alert("no reviewed plan to approve — plan first");
+      // D12: approve THE plan on this screen, not "whatever is pending".
+      await api("/api/approve", "POST", {
+        operator: OPERATOR,
+        mission_id: lastPlan.mission_id,
+        plan_hash: lastPlan.plan_hash,
+      });
       $("plan-card").classList.add("hidden");
       if (trail) trail.setLatLngs([]);
     } catch (e) { alert(e.message); }

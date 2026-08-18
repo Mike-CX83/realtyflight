@@ -23,13 +23,14 @@ import secrets
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 
 from core.approval import ApprovalError, ApprovalRecord, grant_approval
-from core.engine import MissionExecutor
+from core.engine import MissionExecutor, MissionOutcome, MissionResult
 from core.events import EventLog
 from core.geo import distance_m
 from core.policy.dispatch import CircuitBreaker
@@ -47,17 +48,34 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 # --------------------------------------------------------------------------- #
 
 
+# D12 (review C8): one normalized operator type everywhere — stripped, and
+# blank-after-strip is a 422. No whitespace identities in the audit trail.
+Operator = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)
+]
+
+
 class PlanBody(BaseModel):
     request_text: str = Field(min_length=1, max_length=2000)
-    operator: str = Field(min_length=1, max_length=120)
+    operator: Operator
 
 
 class OperatorBody(BaseModel):
-    operator: str = Field(min_length=1, max_length=120)
+    operator: Operator
+
+
+class ApproveBody(BaseModel):
+    """D12 (review C3): approval pins the REVIEWED plan. The page submits the
+    mission_id + plan-hash prefix it displayed; a pending plan that changed
+    since then is a 409, never a silent approval of something unseen."""
+
+    operator: Operator
+    mission_id: str = Field(min_length=1, max_length=64)
+    plan_hash: str = Field(min_length=12, max_length=64)
 
 
 class BreakerBody(BaseModel):
-    operator: str = Field(min_length=1, max_length=120)
+    operator: Operator
     action: str = Field(pattern="^(trip|reset)$")
     reason: str = Field(default="operator kill switch", max_length=300)
 
@@ -83,6 +101,9 @@ class Session:
     mission_task: asyncio.Task | None = None
     result: object | None = None              # MissionResult once terminal
     planner_rounds: int = 0
+    # D12: /api/plan and /api/approve mutate pending state — serialize them so
+    # concurrent requests can't interleave a swap into the approval window.
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def mission_active(self) -> bool:
         return self.mission_task is not None and not self.mission_task.done()
@@ -124,10 +145,31 @@ def create_app(
     app.state.token = token  # __main__ prints it at startup
 
     # ---- the auth stub (swap-point for real accounts + TLS later) ---------- #
+    def _bearer(authorization: str) -> str:
+        """STRICT scheme parse (D12, review C8): only `Bearer <secret>` counts.
+        A bare secret in the header is a 401, exactly as the contract states."""
+        scheme, _, rest = authorization.partition(" ")
+        return rest.strip() if scheme == "Bearer" else ""
+
     async def require_token(authorization: str = Header(default="")) -> None:
-        supplied = authorization.removeprefix("Bearer ").strip()
+        supplied = _bearer(authorization)
         if not supplied or not hmac.compare_digest(supplied, token):
             raise HTTPException(status_code=401, detail="missing or bad token")
+
+    # ---- governance audit (D12: the chain starts at PLANNING, not approval) - #
+    def _audit(mission_id: str, type_: str, **payload) -> None:
+        """Best-effort append to the mission's audit log for governance events
+        that happen OUTSIDE an executor (plan, approve, breaker). Never blocks
+        or breaks the route."""
+        try:
+            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+            log = EventLog(log_path)
+            try:
+                log.append(mission_id, time.time(), type_, payload)
+            finally:
+                log.close()
+        except Exception:
+            pass
 
     # ---- helpers ------------------------------------------------------------ #
     async def live_ctx() -> ValidationContext:
@@ -149,7 +191,7 @@ def create_app(
             "mission_state": ex.machine.current_state.id if ex else None,
             "mission_id": plan.mission_id if plan else None,
             "steps_total": len(plan.steps) if plan else 0,
-            "steps_completed": ex._steps_completed if ex else 0,
+            "steps_completed": ex.steps_completed if ex else 0,
             "photos": len(ex.media) if ex else 0,
             "media": [
                 {"tag": m.tag, "media_id": m.media_id, "path": m.path}
@@ -181,7 +223,9 @@ def create_app(
     @app.get("/media/{name}")
     async def media(name: str, t: str = "", authorization: str = Header(default="")):
         # <img> tags can't send headers — accept the token as ?t= as well.
-        supplied = (authorization.removeprefix("Bearer ").strip()) or t
+        # (Documented tradeoff: query tokens can land in access logs; this
+        # serves sim imagery on a LAN. Short-lived media tokens are G5 work.)
+        supplied = _bearer(authorization) or t
         if not supplied or not hmac.compare_digest(supplied, token):
             raise HTTPException(status_code=401, detail="missing or bad token")
         # sanitized: serve only plain filenames out of the backend's media dir
@@ -196,6 +240,7 @@ def create_app(
     # ---- the governed flow -------------------------------------------------- #
     @app.post("/api/plan")
     async def plan(body: PlanBody, _=Depends(require_token)):
+      async with sess.lock:                       # D12: no concurrent swaps
         if sess.mission_active():
             raise HTTPException(409, "a mission is executing; abort or wait")
 
@@ -209,21 +254,38 @@ def create_app(
             raise HTTPException(503, "no LLM configured: set an API key or DASH_MODEL=scripted")
         model_obj = scripted_model(prop) if model == "scripted" else model
 
-        mission_id = f"DASH-{time.strftime('%Y%m%d-%H%M%S')}"
-        result = await MissionPlanner(model_obj).plan(
-            PlanRequest(
-                mission_id=mission_id,
-                request_text=body.request_text,
-                property=prop,
-                limits=Limits(),
-                failsafe=FailsafePolicy(),
-            )
+        # D12: collision-resistant IDs — two plans in the same second must
+        # never share a history in the event log.
+        mission_id = (
+            f"DASH-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}"
         )
-        if result.plan is None or result.report is None or not result.report.ok:
+        try:
+            result = await MissionPlanner(model_obj).plan(
+                PlanRequest(
+                    mission_id=mission_id,
+                    request_text=body.request_text,
+                    property=prop,
+                    limits=Limits(),
+                    failsafe=FailsafePolicy(),
+                )
+            )
+        except Exception as exc:
+            # Planner construction/edge failures: clean ok:false, never a 500.
+            result = None
+            _audit(mission_id, "plan.failed", error=f"{type(exc).__name__}: {exc}",
+                   operator=body.operator)
+        if result is None or result.plan is None or result.report is None \
+                or not result.report.ok:
+            # D12 (review): a failed attempt CLEARS pending state — no stale
+            # earlier proposal left approvable behind the operator's back.
+            sess.pending_plan = None
+            sess.pending_report = None
             return {
                 "ok": False,
-                "rounds": result.rounds,
-                "static_report": _report_rows(result.report) if result.report else [],
+                "rounds": result.rounds if result else 0,
+                "static_report": (
+                    _report_rows(result.report) if result and result.report else []
+                ),
                 "detail": "planner could not produce a rule-clean plan",
             }
 
@@ -232,6 +294,21 @@ def create_app(
         sess.pending_report = live_report
         sess.result = None
         sess.planner_rounds = result.rounds
+
+        # D12: the governance chain starts HERE, not at approval.
+        _audit(
+            result.plan.mission_id, "plan.proposed",
+            operator=body.operator,
+            request_text=body.request_text[:300],
+            summary=result.plan.summary[:300],
+            plan_hash=compute_plan_hash(result.plan),
+            rounds=result.rounds,
+        )
+        _audit(
+            result.plan.mission_id, "plan.validated",
+            ok=live_report.ok, live_checked=live_report.live_checked,
+            failed_rules=live_report.failed_rules(),
+        )
 
         return {
             "ok": live_report.ok,
@@ -253,11 +330,24 @@ def create_app(
         }
 
     @app.post("/api/approve")
-    async def approve(body: OperatorBody, _=Depends(require_token)):
+    async def approve(body: ApproveBody, _=Depends(require_token)):
+      async with sess.lock:                       # D12: no concurrent swaps
         if sess.pending_plan is None or sess.pending_report is None:
             raise HTTPException(409, "nothing awaiting approval — plan first")
         if sess.mission_active():
             raise HTTPException(409, "a mission is already executing")
+
+        # D12 (review C3): the operator approves the EXACT plan they reviewed.
+        pending_hash = compute_plan_hash(sess.pending_plan)
+        if (
+            body.mission_id != sess.pending_plan.mission_id
+            or not pending_hash.startswith(body.plan_hash)
+        ):
+            raise HTTPException(
+                409,
+                "the pending plan is not the one you reviewed "
+                "(mission/hash mismatch) — re-plan and review again",
+            )
 
         # Re-check liveness at the moment of approval, not planning time.
         fresh_report = validate_plan(sess.pending_plan, await live_ctx())
@@ -268,6 +358,12 @@ def create_app(
             )
         except ApprovalError as exc:
             raise HTTPException(409, f"approval refused: {exc}") from exc
+
+        _audit(
+            sess.pending_plan.mission_id, "approval.granted",
+            approval_id=approval.approval_id, operator=approval.operator,
+            plan_hash=approval.plan_hash, profile=approval.profile,
+        )
 
         Path(sess.log_path).parent.mkdir(parents=True, exist_ok=True)
         log = EventLog(sess.log_path)
@@ -283,6 +379,16 @@ def create_app(
         async def fly():
             try:
                 sess.result = await sess.executor.run()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # D12 (review C7): belt over the executor's own suspenders —
+                # even a crashed mission task leaves a visible terminal result.
+                sess.result = MissionResult(
+                    outcome=MissionOutcome.FAILED,
+                    final_state="failed",
+                    reason=f"mission task crashed: {type(exc).__name__}: {exc}",
+                )
             finally:
                 log.close()
 
@@ -298,30 +404,45 @@ def create_app(
     async def abort(body: OperatorBody, _=Depends(require_token)):
         if sess.executor is None or not sess.mission_active():
             raise HTTPException(409, "no active mission")
-        sess.executor.rec.record("abort.operator", operator=body.operator)
-        sess.executor.abort()
+        # D12: preempt-first lives in the executor; the operator rides in the
+        # same (failure-proof) audit event instead of a separate write BEFORE
+        # the preemption, which is what the review's probe exploited.
+        sess.executor.abort(operator=body.operator)
         return {"aborting": True}
 
     @app.post("/api/hold")
     async def hold(body: OperatorBody, _=Depends(require_token)):
         if sess.executor is None or not sess.mission_active():
             raise HTTPException(409, "no active mission")
-        sess.executor.hold()
+        sess.executor.hold(operator=body.operator)   # D12: audited operator
         return {"holding": True}
 
     @app.post("/api/resume")
     async def resume(body: OperatorBody, _=Depends(require_token)):
         if sess.executor is None or not sess.mission_active():
             raise HTTPException(409, "no active mission")
-        sess.executor.resume()
+        sess.executor.resume(operator=body.operator)  # D12: audited operator
         return {"resuming": True}
 
     @app.post("/api/breaker")
     async def breaker(body: BreakerBody, _=Depends(require_token)):
+        active = sess.executor is not None and sess.mission_active()
+        mission_id = sess.executor.plan.mission_id if active else "SESSION"
         if body.action == "trip":
-            sess.breaker.trip(f"{body.reason} (by {body.operator})")
+            # D12 (review C1): the kill switch PREEMPTS. kill() latches the
+            # breaker and cancels the in-flight command now; the executor
+            # stands down freeze-only. Latching alone let a whole orbit finish.
+            if active:
+                sess.executor.kill(reason=body.reason, operator=body.operator)
+            else:
+                sess.breaker.trip(f"{body.reason} (by {body.operator})")
         else:
             sess.breaker.reset(operator=body.operator)
+        _audit(
+            mission_id, f"breaker.{body.action}",
+            operator=body.operator, reason=body.reason,
+            open=sess.breaker.is_open,
+        )
         return {"breaker_open": sess.breaker.is_open, "reason": sess.breaker.open_reason}
 
     # ---- read side ----------------------------------------------------------- #
@@ -335,14 +456,7 @@ def create_app(
             return {"missions": []}
         log = EventLog(sess.log_path)
         try:
-            cur = log._conn.execute(
-                "SELECT mission_id, COUNT(*), MIN(ts), MAX(ts) FROM mission_events "
-                "GROUP BY mission_id ORDER BY MAX(ts) DESC LIMIT 50"
-            )
-            rows = [
-                {"mission_id": m, "events": n, "started_ts": t0, "ended_ts": t1}
-                for (m, n, t0, t1) in cur.fetchall()
-            ]
+            rows = log.list_missions(limit=50)   # D12: public API, no _conn poking
         finally:
             log.close()
         return {"missions": rows}

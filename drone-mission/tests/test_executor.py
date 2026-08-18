@@ -30,10 +30,11 @@ class Clock:
         return self.t
 
 
-FAST = ExecutorTuning(timeout_factor=2.0, timeout_floor_s=0.25, poll_interval_s=0.005)
+FAST = ExecutorTuning(timeout_factor=2.0, timeout_floor_s=0.25, recovery_cmd_timeout_s=2.0)
 
 
-def build(good_plan, *, cfg: FakeConfig | None = None, clock: Clock | None = None):
+def build(good_plan, *, cfg: FakeConfig | None = None, clock: Clock | None = None,
+          tuning: ExecutorTuning | None = None):
     clock = clock or Clock()
     backend = FakeBackend(clock, cfg or FakeConfig())
     log = EventLog(":memory:")
@@ -47,7 +48,8 @@ def build(good_plan, *, cfg: FakeConfig | None = None, clock: Clock | None = Non
         report = validate_plan(good_plan, live)
         approval = grant_approval(good_plan, report, operator="mike", now_ts=clock())
         return MissionExecutor(
-            good_plan, approval, backend, log, clock=clock, profile="sim", tuning=FAST
+            good_plan, approval, backend, log, clock=clock, profile="sim",
+            tuning=tuning or FAST,
         )
 
     return _mk, backend, log, clock

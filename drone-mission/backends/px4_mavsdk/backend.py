@@ -68,6 +68,10 @@ class PX4Backend:
         self._system = None            # mavsdk.System
         self._tasks: list[asyncio.Task] = []
         self._seen_idem: set[str] = set()
+        # D12 idempotency registry: keys whose command was ACCEPTED by the
+        # vehicle but whose completion evidence never arrived. A retry with an
+        # in-flight key RECONCILES (re-awaits evidence) instead of re-sending.
+        self._inflight: set[str] = set()
         self._media_seq = 0
         self._home_abs_alt: float | None = None
         self._home: GeoPoint | None = None
@@ -178,12 +182,14 @@ class PX4Backend:
         # an old health stream stops vouching for GPS; an old battery stream
         # reports 0% (which PWR-01 then refuses).
         now = self.clock()
-        critical_ts = [
-            self._cache[k][1]
-            for k in ("position", "velocity", "in_air", "armed")
-            if k in self._cache
-        ]
-        snapshot_ts = min(critical_ts)
+        # D12 (review C4): FAIL CLOSED. If ANY flight-critical stream is
+        # missing, the aircraft's state is UNKNOWN — return no snapshot rather
+        # than synthesize safe-looking values (the old armed=False/in_air=False
+        # was read downstream as 'on the ground, skip recovery').
+        critical = ("position", "velocity", "in_air", "armed")
+        if any(k not in self._cache for k in critical):
+            return None
+        snapshot_ts = min(self._cache[k][1] for k in critical)
 
         def _aux_fresh(key: str) -> bool:
             item = self._cache.get(key)
@@ -256,17 +262,21 @@ class PX4Backend:
             return
         self._require_connected()
         a = self._system.action
-        try:
-            await a.set_takeoff_altitude(alt_m)
-            await a.arm()
-            await a.takeoff()
-        except Exception as exc:
-            raise CommandRejected(f"takeoff rejected: {exc}") from exc
+        if idem not in self._inflight:                    # D12: don't re-send
+            self._inflight.add(idem)
+            try:
+                await a.set_takeoff_altitude(alt_m)
+                await a.arm()
+                await a.takeoff()
+            except Exception as exc:
+                self._inflight.discard(idem)              # never accepted
+                raise CommandRejected(f"takeoff rejected: {exc}") from exc
         await self._wait(
             lambda t: t.in_air and abs(t.alt_rel_m - alt_m) <= self.cfg.alt_tolerance_m,
             f"takeoff to {alt_m} m",
         )
         self._done(idem)
+        self._inflight.discard(idem)
 
     async def goto(
         self, p: GeoPoint, alt_m: float, speed_ms: float, yaw_deg: float | None, *, idem: str
@@ -277,25 +287,52 @@ class PX4Backend:
         if self._home_abs_alt is None:
             raise CommandRejected("no home altitude known — cannot convert relative altitude")
         a = self._system.action
-        try:
+        speed_confirmed = True
+        if idem not in self._inflight:                    # D12: don't re-send
+            self._inflight.add(idem)
             try:
-                await a.set_current_speed(speed_ms)
-            except Exception:
-                pass  # older firmwares reject outside offboard; cruise default then applies
-            await a.goto_location(
-                p.lat,
-                p.lon,
-                self._home_abs_alt + alt_m,
-                yaw_deg if yaw_deg is not None else float("nan"),
-            )
-        except Exception as exc:
-            raise CommandRejected(f"goto rejected: {exc}") from exc
+                try:
+                    await a.set_current_speed(speed_ms)
+                except Exception as exc:
+                    # D12 (review C5): an unconfirmed speed is not a free pass.
+                    # We may proceed (older firmwares reject this outside
+                    # offboard), but the evidence wait below then REFUSES on
+                    # observed overspeed — the approved limit holds either way.
+                    speed_confirmed = False
+                    self._note_media_event(
+                        "speed_unconfirmed",
+                        {"requested_ms": speed_ms, "error": str(exc)},
+                    )
+                await a.goto_location(
+                    p.lat,
+                    p.lon,
+                    self._home_abs_alt + alt_m,
+                    yaw_deg if yaw_deg is not None else float("nan"),
+                )
+            except Exception as exc:
+                self._inflight.discard(idem)              # never accepted
+                raise CommandRejected(f"goto rejected: {exc}") from exc
+        else:
+            speed_confirmed = False                       # ambiguous retry: monitor
+
+        limit_ms = speed_ms * 1.25 + 0.5                  # gust/controller slack
+
+        def overspeed(t: TelemetrySnapshot) -> str | None:
+            if not speed_confirmed and t.speed_ms > limit_ms:
+                return (
+                    f"vehicle at {t.speed_ms:.1f} m/s exceeds the approved "
+                    f"{speed_ms:.1f} m/s and the speed command was not accepted"
+                )
+            return None
+
         await self._wait(
             lambda t: distance_m(t.position, p) <= self.cfg.arrive_tolerance_m
             and abs(t.alt_rel_m - alt_m) <= self.cfg.alt_tolerance_m,
             f"goto ({p.lat:.6f},{p.lon:.6f}) @ {alt_m} m",
+            fail=overspeed,
         )
         self._done(idem)
+        self._inflight.discard(idem)
 
     async def set_gimbal_pitch(self, pitch_deg: float, *, idem: str) -> None:
         if self._dup(idem):
@@ -313,8 +350,13 @@ class PX4Backend:
                 await g.take_control(ControlMode.PRIMARY)          # v2
                 await g.set_pitch_and_yaw(pitch_deg, 0.0)           # v2
         except Exception as exc:
-            # Gimbal-less airframe or protocol quirk: record-and-continue is the
-            # sim-world call; strictness for real aircraft arrives with G5 work.
+            if self.cfg.is_physical:
+                # D12 (review): a physical shoot must never silently lose its
+                # gimbal — fail typed; the executor's failsafe brings it home.
+                raise CommandRejected(
+                    f"gimbal command failed on a physical aircraft: {exc}"
+                ) from exc
+            # Gimbal-less sim airframe or protocol quirk: record-and-continue.
             self._note_media_event(
                 "gimbal_unavailable", {"pitch_deg": pitch_deg, "error": str(exc)}
             )
@@ -327,40 +369,55 @@ class PX4Backend:
         ref = self._media_ref_for(idem, spec)
         media_path = Path(self.cfg.media_dir)
         await asyncio.to_thread(media_path.mkdir, parents=True, exist_ok=True)
-        jpg = media_path / f"{ref.media_id}_{spec.tag}.jpg"
 
-        frame_written = False
-        if self.cfg.camera_mode == "rtsp":
-            # D10: cv2 is blocking C code — running it on the event loop
-            # starves the MAVSDK telemetry cachers (the D8 review finding).
-            frame_written = await asyncio.to_thread(self._grab_rtsp_frame, jpg)
-            if not frame_written:
-                # In the real-camera profile a missing frame is a FAILURE the
-                # executor must see (bounded retries, then failsafe) — never a
-                # silent synthetic stub that reports success.
-                raise CommandTimeout(
-                    f"RTSP frame grab failed ({self.cfg.rtsp_url}) — refusing to "
-                    "substitute a synthetic image in rtsp mode"
-                )
-        if not frame_written:  # synthetic mode: honest evidence stub
-            jpg.write_bytes(_STUB_JPEG)
-
-        sidecar = jpg.with_suffix(".json")
-        sidecar.write_text(
-            json.dumps(
-                {
-                    "media_id": ref.media_id,
-                    "tag": spec.tag,
-                    "mode": spec.mode,
-                    "camera_mode": self.cfg.camera_mode if frame_written else "synthetic",
-                    "ts": self.clock(),
-                    "telemetry": tel.model_dump(mode="json") if tel else None,
-                },
-                indent=2,
+        # D12 (review): HONEST BRACKETS. The capabilities advertise bracket3/5,
+        # so bracketN captures N frames — one file each — instead of quietly
+        # writing a single JPEG and calling it a bracket.
+        n_frames = {"single": 1, "bracket3": 3, "bracket5": 5}.get(spec.mode, 1)
+        frames: list[str] = []
+        rtsp_ok = 0
+        for k in range(n_frames):
+            jpg = media_path / (
+                f"{ref.media_id}_{spec.tag}.jpg" if k == 0
+                else f"{ref.media_id}_{spec.tag}_b{k}.jpg"
             )
+            frame_written = False
+            if self.cfg.camera_mode == "rtsp":
+                # D10: cv2 is blocking C code — running it on the event loop
+                # starves the MAVSDK telemetry cachers (the D8 review finding).
+                frame_written = await asyncio.to_thread(self._grab_rtsp_frame, jpg)
+                if not frame_written:
+                    # In the real-camera profile a missing frame is a FAILURE
+                    # the executor must see (bounded retries, then failsafe) —
+                    # never a silent synthetic stub that reports success.
+                    raise CommandTimeout(
+                        f"RTSP frame grab failed ({self.cfg.rtsp_url}) — refusing to "
+                        "substitute a synthetic image in rtsp mode"
+                    )
+                rtsp_ok += 1
+            if not frame_written:  # synthetic mode: honest evidence stub
+                await asyncio.to_thread(jpg.write_bytes, _STUB_JPEG)
+            frames.append(str(jpg))
+
+        primary = Path(frames[0])
+        sidecar = primary.with_suffix(".json")
+        payload = json.dumps(
+            {
+                "media_id": ref.media_id,
+                "tag": spec.tag,
+                "mode": spec.mode,
+                "camera_mode": (
+                    self.cfg.camera_mode if rtsp_ok == n_frames else "synthetic"
+                ),
+                "frames": frames,
+                "ts": self.clock(),
+                "telemetry": tel.model_dump(mode="json") if tel else None,
+            },
+            indent=2,
         )
+        await asyncio.to_thread(sidecar.write_text, payload)  # off-loop (D12)
         self._done(idem)
-        return ref.model_copy(update={"path": str(jpg)})
+        return ref.model_copy(update={"path": str(primary)})
 
     def _grab_rtsp_frame(self, out: Path) -> bool:
         try:  # pragma: no cover (needs stream)
@@ -399,10 +456,13 @@ class PX4Backend:
         if self._dup(idem):
             return
         self._require_connected()
-        try:
-            await self._system.action.return_to_launch()
-        except Exception as exc:
-            raise CommandRejected(f"RTL rejected: {exc}") from exc
+        if idem not in self._inflight:                    # D12: don't re-send
+            self._inflight.add(idem)
+            try:
+                await self._system.action.return_to_launch()
+            except Exception as exc:
+                self._inflight.discard(idem)
+                raise CommandRejected(f"RTL rejected: {exc}") from exc
         home = self._home
         await self._wait(
             lambda t: (not t.in_air)
@@ -413,6 +473,7 @@ class PX4Backend:
             "return to launch",
         )
         self._done(idem)
+        self._inflight.discard(idem)
 
     async def land(self, *, idem: str) -> None:
         if self._dup(idem):
@@ -422,16 +483,20 @@ class PX4Backend:
         if tel is not None and not tel.in_air:
             self._done(idem)  # RTL already landed us — success, not an error
             return
-        try:
-            await self._system.action.land()
-        except Exception as exc:
-            raise CommandRejected(f"land rejected: {exc}") from exc
+        if idem not in self._inflight:                    # D12: don't re-send
+            self._inflight.add(idem)
+            try:
+                await self._system.action.land()
+            except Exception as exc:
+                self._inflight.discard(idem)
+                raise CommandRejected(f"land rejected: {exc}") from exc
         await self._wait(lambda t: not t.in_air, "land")
         try:
             await self._system.action.disarm()
         except Exception:
             pass  # PX4 auto-disarms after landing; explicit disarm is belt-and-suspenders
         self._done(idem)
+        self._inflight.discard(idem)
 
     async def abort_motion(self) -> None:
         """Stop moving NOW: PX4 Hold mode freezes the aircraft in place."""
@@ -476,10 +541,17 @@ class PX4Backend:
             json.dumps({"kind": kind, "ts": self.clock(), **payload}) + "\n"
         )
 
-    async def _wait(self, done, what: str) -> None:
+    async def _wait(self, done, what: str, *, fail=None) -> None:
+        """Evidence wait. `fail(tel)` (D12) is a safety monitor: returning a
+        message aborts the wait with CommandRejected — used to enforce the
+        approved speed when set_current_speed was refused (review C5)."""
         deadline = self.clock() + self.cfg.command_wait_s
         while True:
             tel = await self.latest_telemetry()
+            if tel is not None and fail is not None:
+                msg = fail(tel)
+                if msg:
+                    raise CommandRejected(msg)
             if tel is not None and done(tel):
                 return
             if self.clock() > deadline:

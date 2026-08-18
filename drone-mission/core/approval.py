@@ -71,12 +71,28 @@ def grant_approval(
     """The ONLY way an ApprovalRecord comes into existence.
 
     Refuses (raises ApprovalError) unless:
+    - the report PROVES it judged THIS plan (plan_hash match — D12, review C3), AND
+    - the report COVERS the full required rule manifest (an empty or partial
+      report is vacuously 'ok' and proves nothing — D12), AND
     - the report passed every rule (report.ok), AND
     - the report was live-checked (static-only reports cannot authorize flight), AND
+    - the operator is a real, non-blank identity, AND
     - for profile='real': the operator typed the exact confirmation phrase.
     """
+    from core.policy.engine import required_rule_ids
+
+    operator = operator.strip()
+    if not operator:
+        raise ApprovalError("Cannot approve: a named, non-blank operator is required.")
     if not report.schema_ok:
         raise ApprovalError("Cannot approve: the plan never parsed (SCHEMA-01 failed).")
+    plan_hash = compute_plan_hash(plan)
+    if report.plan_hash != plan_hash:
+        raise ApprovalError(
+            "Cannot approve: this validation report was not produced for THIS plan "
+            "(plan hash mismatch or missing). A report is proof about one exact "
+            "plan — re-run validation."
+        )
     if not report.ok:
         raise ApprovalError(
             f"Cannot approve: validation failed rules {report.failed_rules()}."
@@ -86,6 +102,12 @@ def grant_approval(
             "Cannot approve: this report is static-only (no live telemetry/capabilities). "
             "Run validation with a connected backend first — a plan is approved against "
             "a real drone state, not on paper."
+        )
+    missing = required_rule_ids(live=True) - {r.rule for r in report.results}
+    if missing:
+        raise ApprovalError(
+            f"Cannot approve: report never ran required rules {sorted(missing)}. "
+            "A rule that didn't run is a rule that didn't pass."
         )
 
     real_confirmed = False
@@ -97,7 +119,6 @@ def grant_approval(
             )
         real_confirmed = True
 
-    plan_hash = compute_plan_hash(plan)
     approval_id = hashlib.sha256(
         f"{plan.mission_id}:{plan_hash}:{operator}:{now_ts:.3f}".encode()
     ).hexdigest()[:16]

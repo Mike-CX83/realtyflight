@@ -19,6 +19,7 @@ Safety properties encoded here:
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -59,9 +60,11 @@ class PlannerResult:
 
 
 class MissionPlanner:
-    def __init__(self, model, *, max_repair_rounds: int = MAX_REPAIR_ROUNDS) -> None:
+    def __init__(self, model, *, max_repair_rounds: int = MAX_REPAIR_ROUNDS,
+                 llm_timeout_s: float = 120.0) -> None:
         self._agent = Agent(model, output_type=PlanDraft, system_prompt=SYSTEM_PROMPT)
         self._max_repairs = max_repair_rounds
+        self._llm_timeout_s = llm_timeout_s
 
     async def plan(self, req: PlanRequest) -> PlannerResult:
         transcript: list[str] = []
@@ -73,7 +76,23 @@ class MissionPlanner:
         history = None
 
         for round_no in range(1 + self._max_repairs):
-            run = await self._agent.run(prompt, message_history=history)
+            # D12 (review): 'the planner never raises' is now enforced, not
+            # asserted — a dead API, bad model object, or hung call becomes an
+            # honest failing PlannerResult inside a bounded timeout.
+            try:
+                run = await asyncio.wait_for(
+                    self._agent.run(prompt, message_history=history),
+                    timeout=self._llm_timeout_s,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                transcript.append(
+                    f"MODEL-FAILURE[{round_no}]: {type(exc).__name__}: {exc}"
+                )
+                return PlannerResult(
+                    plan=plan, report=report, rounds=round_no + 1, transcript=transcript
+                )
             draft: PlanDraft = run.output
             history = run.all_messages()
             transcript.append(
