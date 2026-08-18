@@ -18,6 +18,7 @@ Run:  python -m server            (env: DASH_BACKEND=fake|px4, DASH_MODEL,
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hmac
 import secrets
 import time
@@ -49,9 +50,14 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
 # D12 (review C8): one normalized operator type everywhere — stripped, and
-# blank-after-strip is a 422. No whitespace identities in the audit trail.
+# blank-after-strip is a 422. D12.1: control/format characters are refused
+# too — no invisible identities in the audit trail.
 Operator = Annotated[
-    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)
+    str,
+    StringConstraints(
+        strip_whitespace=True, min_length=1, max_length=120,
+        pattern=r"^[^\x00-\x1F\x7F]+$",
+    ),
 ]
 
 
@@ -141,7 +147,30 @@ def create_app(
 
     token = secret or secrets.token_urlsafe(24)
     sess = Session(backend=backend, model=model, log_path=log_path)
-    app = FastAPI(title="RealtyFlight dashboard", docs_url=None, redoc_url=None)
+    audit_drops = {"n": 0}  # D12.1: audit-write failures are counted, not silent
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _lifespan(_app):
+        yield
+        # D12.1 (rerun): server shutdown must never orphan a flying mission —
+        # request abort, wait boundedly for the recovery, then disconnect the
+        # backend (which also stops the mavsdk_server subprocess).
+        try:
+            if sess.mission_active():
+                sess.executor.abort(operator="server-shutdown")
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(sess.mission_task, timeout=15.0)
+        except Exception:
+            pass
+        with contextlib.suppress(Exception):
+            await sess.backend.disconnect()
+
+    app = FastAPI(
+        title="RealtyFlight dashboard", docs_url=None, redoc_url=None,
+        lifespan=_lifespan,
+    )
     app.state.token = token  # __main__ prints it at startup
 
     # ---- the auth stub (swap-point for real accounts + TLS later) ---------- #
@@ -169,7 +198,7 @@ def create_app(
             finally:
                 log.close()
         except Exception:
-            pass
+            audit_drops["n"] += 1  # D12.1: counted and surfaced in /api/state
 
     # ---- helpers ------------------------------------------------------------ #
     async def live_ctx() -> ValidationContext:
@@ -187,6 +216,7 @@ def create_app(
             "ts": time.time(),
             "backend": getattr(sess.backend, "name", "unknown"),
             "breaker_open": sess.breaker.is_open,
+            "audit_drops": audit_drops["n"],
             "mission_active": sess.mission_active(),
             "mission_state": ex.machine.current_state.id if ex else None,
             "mission_id": plan.mission_id if plan else None,
@@ -243,6 +273,12 @@ def create_app(
       async with sess.lock:                       # D12: no concurrent swaps
         if sess.mission_active():
             raise HTTPException(409, "a mission is executing; abort or wait")
+
+        # D12.1 (rerun): a NEW planning attempt invalidates whatever was
+        # pending IMMEDIATELY — no early failure path (no telemetry, no
+        # model, crash) may leave yesterday's plan silently approvable.
+        sess.pending_plan = None
+        sess.pending_report = None
 
         tel = await sess.backend.latest_telemetry()
         if tel is None:

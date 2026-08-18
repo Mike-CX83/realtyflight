@@ -65,8 +65,14 @@ MAX_RETRIES = 2
 
 
 class DispatchBlocked(Exception):
-    """Raised by the per-command guard when the circuit breaker is open.
-    The command was NOT sent; the executor stands down (freeze-only)."""
+    """Raised by the per-command guard when the circuit breaker is open or the
+    full live gate denies. The command was NOT sent; the executor recovers
+    (failsafe RTL for reality-denials, freeze-only for the breaker)."""
+
+
+class ManualOverrideDetected(Exception):
+    """Raised by the per-command guard when the pilot's sticks are live —
+    autonomy surrenders the aircraft immediately (D12.1)."""
 
 
 class MissionOutcome(StrEnum):
@@ -156,7 +162,12 @@ class MissionExecutor:
         self._record_safe("breaker.kill", reason=reason, operator=operator)
 
     def hold(self, *, operator: str | None = None) -> None:
+        """Operator hold. D12.1 (rerun): PREEMPTIVE — cancels the in-flight
+        step instead of waiting for it to finish; the drone freezes and pauses
+        NOW. Resume re-dispatches the same step on the same idempotency key,
+        which is exactly what the keys exist for."""
         self._hold_requested.set()
+        self._preempt_current()
         self._record_safe("hold.requested", operator=operator)
 
     def resume(self, *, operator: str | None = None) -> None:
@@ -209,10 +220,10 @@ class MissionExecutor:
         return bool(tel and tel.manual_input_detected)
 
     def _guard(self, where: str) -> None:
-        """The per-command wall (D12, review C1): called immediately before
-        EVERY backend command — orbit segments, captures, retries included.
-        An open breaker or a requested abort stops the NEXT command, not the
-        next step."""
+        """The cheap per-command wall (D12): abort/breaker, synchronous.
+        Used ALONE only for the plan-tail recovery commands (RTL/land), which
+        deliberately bypass reality gates — flying home on a low battery must
+        never be vetoed by the battery rule."""
         if self._abort_requested.is_set():
             raise asyncio.CancelledError()
         if self.breaker.is_open:
@@ -220,24 +231,69 @@ class MissionExecutor:
                 f"circuit breaker open ({self.breaker.open_reason}) at {where}"
             )
 
+    async def _live_guard(self, where: str) -> None:
+        """The FULL per-command wall (D12.1, rerun C1): abort/kill/breaker AND
+        the complete live dispatch gate — battery, GPS, telemetry freshness,
+        capabilities, approval TTL/hash, sim/real profile — plus manual-stick
+        detection, immediately before EVERY work command. The rerun's probe
+        (battery to 0% mid-orbit, 44 further commands) dies here."""
+        self._guard(where)
+        live = await self._live_ctx()
+        if live.telemetry is not None and live.telemetry.manual_input_detected:
+            raise ManualOverrideDetected(where)
+        dctx = DispatchContext(
+            now_ts=self.clock(), profile=self.profile, approval=self.approval, live=live
+        )
+        violations = check_dispatch(self.plan, dctx, self.breaker)
+        if violations:
+            rules = sorted({v.rule for v in violations})
+            self._record_safe(
+                "gate.denied", where=where, rules=rules,
+                messages=[v.message for v in violations][:6],
+            )
+            raise DispatchBlocked(f"gate: {rules} at {where}")
+        self._guard(where)  # re-check after the awaits above
+
     # ------------------------------------------------------------- main loop
 
     async def run(self) -> MissionResult:
         """ONE exception boundary (D12, review C7): nothing escapes without a
         terminal state. Cancellation of the mission task itself is the only
         thing allowed through (its owner is telling US to stop existing)."""
+        res: MissionResult | None = None
         try:
-            return await self._run_governed()
+            res = await self._run_governed()
+            return res
         except asyncio.CancelledError:
             raise
         except DispatchBlocked as exc:
-            return await self._failsafe_recovery(self._steps_completed, str(exc))
+            res = await self._failsafe_recovery(self._steps_completed, str(exc))
+            return res
+        except ManualOverrideDetected as exc:
+            m = self.machine
+            self._record_safe("override.detected", where=str(exc))
+            with contextlib.suppress(Exception):
+                if m.current_state.id in ("executing", "paused"):
+                    m.manual_override()
+            res = MissionResult(
+                outcome=MissionOutcome.OVERRIDDEN,
+                final_state=m.current_state.id,
+                reason="manual stick input",
+                steps_completed=self._steps_completed,
+                media=self.media,
+            )
+            return res
         except Exception as exc:  # the last wall
-            return await self._crash_terminal(exc)
+            res = await self._crash_terminal(exc)
+            return res
         finally:
+            # D12.1 (rerun): the closing event carries the VERDICT, not just
+            # counters — a replay alone must tell you how the mission ended.
             self._record_safe(
                 "mission.closed",
                 state=self.machine.current_state.id,
+                outcome=(res.outcome.value if res else None),
+                reason=(res.reason if res and res.reason else None),
                 steps_completed=self._steps_completed,
                 media_count=len(self.media),
             )
@@ -270,6 +326,18 @@ class MissionExecutor:
                 reason="backend preflight failed",
             )
 
+        # D12.1 (rerun C2): preflight can be SLOW. Re-run the gate now, so an
+        # approval that expired during preflight cannot be laundered by
+        # activation (an activated approval never expires, by design).
+        denied = await self._gate("activation")
+        if denied:
+            m.start_execution()
+            m.fail()
+            return MissionResult(
+                outcome=MissionOutcome.REJECTED_AT_GATE,
+                final_state=m.current_state.id,
+                reason=f"activation gate: {denied}",
+            )
         self.approval = self.approval.activated(self.clock())
         self.rec.record(
             "approval.activated",
@@ -280,7 +348,9 @@ class MissionExecutor:
         )
         m.start_execution()
 
-        for i, step in enumerate(self.plan.steps):
+        i = 0
+        while i < len(self.plan.steps):  # while, not for: preemptive hold
+            step = self.plan.steps[i]    # re-dispatches the SAME step (D12.1)
             # ---- operator/kill/hold/override checkpoints between steps ----- #
             if self._abort_requested.is_set():
                 return await self._recover_abort(i)
@@ -310,15 +380,7 @@ class MissionExecutor:
                     return await self._failsafe_recovery(i, f"resume gate: {denied}")
                 m.resume()
 
-            # ---- the dispatch gate, before EVERY step ----------------------- #
-            if isinstance(step, (ReturnHome, Land)):
-                pass  # plan-tail recovery commands gate only on breaker/guard
-            else:
-                denied = await self._gate(f"step:{i}")
-                if denied:
-                    return await self._failsafe_recovery(i, f"gate: {denied}")
-
-            # ---- dispatch with watchdog + bounded retries ------------------- #
+            # ---- dispatch; every command inside re-runs the FULL gate ------- #
             try:
                 await self._dispatch_with_retries(i, step)
             except asyncio.CancelledError:
@@ -326,6 +388,16 @@ class MissionExecutor:
                     return await self._failsafe_recovery(
                         i, f"circuit breaker open ({self.breaker.open_reason})"
                     )
+                if self._hold_requested.is_set() and not self._abort_requested.is_set():
+                    # D12.1: preemptive hold cancelled this step mid-flight.
+                    # Loop back WITHOUT incrementing — the checkpoint pauses,
+                    # and resume re-dispatches this step (idem keys reconcile).
+                    if m.current_state.id != "executing":
+                        # plan-tail (returning/landing): hold is not honored
+                        self._hold_requested.clear()
+                        self._record_safe("hold.ignored", step=i,
+                                          why="in return/land phase")
+                    continue
                 return await self._recover_abort(i)
             except DispatchBlocked as exc:
                 return await self._failsafe_recovery(i, str(exc))
@@ -334,6 +406,7 @@ class MissionExecutor:
 
             self._steps_completed += 1
             self.rec.record("step.completed", step=i, action=step.action)
+            i += 1
 
         m.touchdown() if m.current_state.id == "landing" else None
         return MissionResult(
@@ -353,7 +426,11 @@ class MissionExecutor:
         )
         last_exc: Exception | None = None
         for attempt in range(1 + MAX_RETRIES):
-            self._guard(f"step:{i}:attempt:{attempt}")  # retries re-check (D12)
+            # retries re-check (D12); work steps re-check REALITY too (D12.1)
+            if isinstance(step, (ReturnHome, Land)):
+                self._guard(f"step:{i}:attempt:{attempt}")
+            else:
+                await self._live_guard(f"step:{i}:attempt:{attempt}")
             self.rec.record(
                 "step.dispatched", step=i, action=step.action, attempt=attempt, idem=idem
             )
@@ -379,20 +456,20 @@ class MissionExecutor:
     async def _perform(self, i: int, step, idem: str) -> None:
         b = self.backend
         if isinstance(step, Takeoff):
-            self._guard(f"takeoff:{i}")
+            await self._live_guard(f"takeoff:{i}")
             await b.takeoff(step.alt_m, idem=idem)
             await self._require_alt(step.alt_m, tolerance=1.5)
         elif isinstance(step, Goto):
-            self._guard(f"goto:{i}")
+            await self._live_guard(f"goto:{i}")
             await b.goto(step.to, step.alt_m, step.speed_ms, step.yaw_deg, idem=idem)
             await self._require_position(step.to)
         elif isinstance(step, Orbit):
             await self._fly_orbit(i, step, idem)
         elif isinstance(step, SetGimbal):
-            self._guard(f"gimbal:{i}")
+            await self._live_guard(f"gimbal:{i}")
             await b.set_gimbal_pitch(step.pitch_deg, idem=idem)
         elif isinstance(step, CapturePhoto):
-            self._guard(f"capture:{i}")
+            await self._live_guard(f"capture:{i}")
             ref = await b.capture_photo(step.capture, idem=idem)
             self.media.append(ref)
             self.rec.record("media.captured", step=i, tag=ref.tag, media_id=ref.media_id)
@@ -447,7 +524,7 @@ class MissionExecutor:
         sign = 1.0 if step.direction == "cw" else -1.0
 
         for j, mag in enumerate(angles):
-            self._guard(f"orbit:{i}:wp{j}")           # per-command wall (D12)
+            await self._live_guard(f"orbit:{i}:wp{j}")  # FULL wall per command (D12.1)
             angle = sign * mag
             rad = math.radians(angle)
             # point on the ring, in the center's local frame (x east, y north)
@@ -460,7 +537,7 @@ class MissionExecutor:
             await self.backend.goto(wp, step.alt_m, step.speed_ms, yaw, idem=f"{idem}:wp{j}")
 
             if mag in cap_set:
-                self._guard(f"orbit:{i}:cap{j}")
+                await self._live_guard(f"orbit:{i}:cap{j}")
                 ref = await self.backend.capture_photo(
                     step.capture, idem=f"{idem}:cap{int(round(mag * 10))}"
                 )
@@ -506,6 +583,14 @@ class MissionExecutor:
         if tel is None:
             raise CommandTimeout("no telemetry for evidence check")
         age = self.clock() - tel.ts
+        # D12.1 (rerun C6): freshness is a BAND, 0 <= age <= limit — a
+        # future-dated snapshot (clock skew, replay) proves nothing, exactly
+        # as Wave-4 already ruled for validation.
+        if age < -1e-6:
+            raise CommandTimeout(
+                f"telemetry timestamp is {-age:.1f}s in the future — clock skew; "
+                "refusing to treat it as evidence"
+            )
         if age > self.plan.failsafe.telemetry_stale_hold_s:
             raise CommandTimeout(f"telemetry too old for evidence ({age:.1f}s)")
         return tel
@@ -518,7 +603,7 @@ class MissionExecutor:
         self._record_safe("abort.executing", at_step=at_step)
         if m.current_state.id in ("executing", "paused"):
             m.operator_abort()
-        await self.backend.abort_motion()
+        await self._freeze()
         await self._recovery_flight()
         # D10 P0: a terminal "completed" requires LANDED EVIDENCE, not just
         # having reached the landing state. If recovery's own commands failed
@@ -539,7 +624,13 @@ class MissionExecutor:
                 steps_completed=self._steps_completed,
                 media=self.media,
             )
-        m.touchdown() if m.current_state.id == "landing" else None
+        # D12.1 (rerun): landed evidence in hand — drive the machine all the
+        # way to terminal, whatever recovery phase we landed from. An ABORTED
+        # mission must never leave the state machine dangling in 'returning'.
+        if m.current_state.id == "returning":
+            m.begin_landing()
+        if m.current_state.id == "landing":
+            m.touchdown()
         return MissionResult(
             outcome=MissionOutcome.ABORTED,
             final_state=m.current_state.id,
@@ -554,7 +645,7 @@ class MissionExecutor:
         self._record_safe("failsafe.triggered", at_step=at_step, reason=reason)
         if m.current_state.id in ("executing", "paused"):
             m.fault_abort()
-        await self.backend.abort_motion()
+        await self._freeze()
         await self._recovery_flight()
         if m.current_state.id not in ("failed", "completed"):
             m.fail()
@@ -574,8 +665,9 @@ class MissionExecutor:
         tel = await self.backend.latest_telemetry()
         if tel is None:
             return False
-        if (self.clock() - tel.ts) > self.plan.failsafe.telemetry_stale_hold_s:
-            return False
+        age = self.clock() - tel.ts
+        if age < -1e-6 or age > self.plan.failsafe.telemetry_stale_hold_s:
+            return False  # future-dated OR stale: not evidence (D12.1)
         return bool(
             not tel.in_air
             and tel.alt_rel_m <= LANDED_MAX_ALT_M
@@ -601,18 +693,17 @@ class MissionExecutor:
             if m.current_state.id == "aborting":
                 m.begin_landing()
             return
-        if self.breaker.is_open:
-            self._record_safe(
-                "recovery.suppressed",
-                why=f"breaker open ({self.breaker.open_reason}): freeze-only stand-down",
-            )
-            with contextlib.suppress(Exception):
-                await self.backend.abort_motion()  # the one exempt command
+        if await self._suppressed_by_breaker("recovery entry"):
             return
         try:
             if m.current_state.id in ("executing", "aborting"):
                 m.begin_return()
             if m.current_state.id == "returning":
+                # D12.1 (rerun): the breaker is rechecked immediately before
+                # EACH recovery command — a kill that lands mid-recovery stops
+                # the NEXT command, not the next mission.
+                if await self._suppressed_by_breaker("before recovery RTL"):
+                    return
                 self._record_safe("failsafe.dispatch", command="return_home")
                 await self._bounded_recovery_cmd(
                     self.backend.return_home(idem=f"{self.plan.mission_id}:recovery:rth"),
@@ -620,20 +711,62 @@ class MissionExecutor:
                 )
                 m.begin_landing()
             if m.current_state.id == "landing":
+                if await self._suppressed_by_breaker("before recovery land"):
+                    return
                 self._record_safe("failsafe.dispatch", command="land")
                 await self._bounded_recovery_cmd(
                     self.backend.land(idem=f"{self.plan.mission_id}:recovery:land"),
                     "land",
                 )
         except asyncio.CancelledError:
-            raise
+            # D12.1: recovery commands live in the preemptible slot now, so a
+            # kill (or abort) CAN cancel them mid-flight.
+            if self._kill_requested.is_set():
+                self._record_safe(
+                    "recovery.suppressed",
+                    why="kill during recovery: freeze-only stand-down",
+                )
+                await self._freeze()
+                return
+            if self._abort_requested.is_set():
+                self._record_safe("recovery.interrupted", why="abort during recovery")
+                return
+            raise  # the mission task itself is being torn down
         except Exception as exc:
             self._record_safe("recovery.failed", error=f"{type(exc).__name__}: {exc}")
 
+    async def _suppressed_by_breaker(self, where: str) -> bool:
+        """Freeze-only stand-down check, used before EVERY recovery command."""
+        if self.breaker.is_open or self._kill_requested.is_set():
+            self._record_safe(
+                "recovery.suppressed",
+                why=f"breaker open ({self.breaker.open_reason}) at {where}: "
+                "freeze-only stand-down",
+            )
+            await self._freeze()
+            return True
+        return False
+
+    async def _freeze(self) -> None:
+        """The single breaker-exempt command (abort_motion), BOUNDED (D12.1) —
+        the freeze itself must never hang the mission. Never raises."""
+        try:
+            await asyncio.wait_for(
+                self.backend.abort_motion(),
+                timeout=min(10.0, self.tuning.recovery_cmd_timeout_s),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._record_safe("freeze.unconfirmed", error=repr(exc))
+
     async def _bounded_recovery_cmd(self, coro, what: str) -> None:
         """A recovery command with its own watchdog (D12): a hung RTL/land can
-        no longer strand the mission airborne in 'returning' forever."""
+        no longer strand the mission airborne in 'returning' forever. D12.1:
+        it runs in the SAME preemptible slot as ordinary commands, so kill()
+        and abort() can cancel recovery mid-flight too."""
         task = asyncio.ensure_future(coro)
+        self._current_task = task
         try:
             await asyncio.wait_for(
                 asyncio.shield(task), timeout=self.tuning.recovery_cmd_timeout_s
@@ -646,6 +779,8 @@ class MissionExecutor:
                 f"recovery command timed out: {what} "
                 f"(> {self.tuning.recovery_cmd_timeout_s:.0f}s)"
             ) from None
+        finally:
+            self._current_task = None
 
     async def _crash_terminal(self, exc: Exception) -> MissionResult:
         """The last wall (D12, review C7): an untyped failure is recorded,
@@ -658,7 +793,7 @@ class MissionExecutor:
             if m.current_state.id in ("executing", "paused"):
                 m.fault_abort()
             if m.current_state.id not in terminal:
-                await self.backend.abort_motion()
+                await self._freeze()
                 await self._recovery_flight()
         except asyncio.CancelledError:
             raise
@@ -680,20 +815,43 @@ class MissionExecutor:
     async def _wait_resume(self) -> None:
         resume = asyncio.ensure_future(self._resume_requested.wait())
         abort = asyncio.ensure_future(self._abort_requested.wait())
-        try:
-            await asyncio.wait({resume, abort}, return_when=asyncio.FIRST_COMPLETED)
+        kill = asyncio.ensure_future(self._kill_requested.wait())  # D12.1: a kill
+        try:                                # while paused must WAKE the mission
+            await asyncio.wait(
+                {resume, abort, kill}, return_when=asyncio.FIRST_COMPLETED
+            )
         finally:
             resume.cancel()
             abort.cancel()
+            kill.cancel()
         self._resume_requested.clear()
 
     def _expected_duration_s(self, step) -> float:
+        """Per-step watchdog budget, D12.1 (rerun): derived from the mission's
+        own envelope (worst legal leg, altitude deltas, capture counts) instead
+        of flat constants — a legal slow descent or a dense bracketed orbit
+        must never be killed by an optimistic timeout. Overestimating is fine;
+        PWR-02 owns the endurance math, the watchdog only catches HUNG work."""
+        from core.schema import orbit_capture_count
+
+        lim = self.plan.limits
         if isinstance(step, Takeoff):
-            return step.alt_m / 1.5
+            return step.alt_m / 1.0 + 15.0
         if isinstance(step, Goto):
-            return 30.0  # conservative fixed leg budget; refined per-leg later
+            leg = 2.0 * lim.max_home_dist_m / max(step.speed_ms, 0.5)
+            climb = lim.max_alt_m / 1.0  # full-envelope altitude change allowance
+            return leg + climb + 15.0
         if isinstance(step, Orbit):
-            return (2 * math.pi * step.radius_m * (step.arc_deg / 360.0)) / step.speed_ms + 60.0
+            t = (2 * math.pi * step.radius_m * (step.arc_deg / 360.0)) / step.speed_ms + 60.0
+            if step.captures_every_deg is not None and step.capture is not None:
+                t += orbit_capture_count(step.arc_deg, step.captures_every_deg) * 4.0
+            return t
         if isinstance(step, Hold):
-            return step.duration_s
+            return step.duration_s + 5.0
+        if isinstance(step, ReturnHome):
+            return 2.0 * lim.max_home_dist_m / max(lim.max_speed_ms, 0.5) + 30.0
+        if isinstance(step, Land):
+            return lim.max_alt_m / 0.5 + 20.0
+        if isinstance(step, CapturePhoto):
+            return 30.0  # bracket5 over RTSP: several grabs + warm-up
         return 15.0

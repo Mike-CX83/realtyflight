@@ -214,7 +214,10 @@ class PX4Backend:
             gps_ok=(
                 bool(health.is_global_position_ok) if health and _aux_fresh("health") else False
             ),
-            sat_count=gps.num_satellites if gps else None,
+            # D12.1: a stale GPS stream stops vouching for its count too —
+            # sat_count is ADVISORY when present (TEL-01's load-bearing deny is
+            # fresh gps_ok from the health stream); unknown reads as None.
+            sat_count=(gps.num_satellites if gps and _aux_fresh("gps") else None),
             link_ok=True,  # we ARE receiving telemetry; staleness is judged by ts
             flight_mode=str(self._get("flight_mode") or "UNKNOWN"),
             armed=bool(self._get("armed")),
@@ -315,14 +318,27 @@ class PX4Backend:
         else:
             speed_confirmed = False                       # ambiguous retry: monitor
 
-        limit_ms = speed_ms * 1.25 + 0.5                  # gust/controller slack
+        # D12.1 (rerun C5): the hard cap is ALWAYS on — a speed ACK that
+        # "succeeds" without taking effect is caught exactly like a rejected
+        # one. Tight margin: max(1 m/s, 15%) — the rerun's probe (5.4 m/s on a
+        # 4 m/s approval) dies at 5.0. Three consecutive overspeed polls
+        # (~0.6 s sustained) keep momentary controller transients from
+        # false-tripping; the SITL contract re-cert watches for that.
+        hard_ms = speed_ms + max(1.0, 0.15 * speed_ms)
+        strikes = 0
 
         def overspeed(t: TelemetrySnapshot) -> str | None:
-            if not speed_confirmed and t.speed_ms > limit_ms:
-                return (
-                    f"vehicle at {t.speed_ms:.1f} m/s exceeds the approved "
-                    f"{speed_ms:.1f} m/s and the speed command was not accepted"
-                )
+            nonlocal strikes
+            if t.speed_ms > hard_ms:
+                strikes += 1
+                if strikes >= 3:
+                    return (
+                        f"vehicle sustained {t.speed_ms:.1f} m/s over the approved "
+                        f"{speed_ms:.1f} m/s (cap {hard_ms:.1f}; speed command "
+                        f"{'accepted' if speed_confirmed else 'NOT accepted'})"
+                    )
+            else:
+                strikes = 0
             return None
 
         await self._wait(
@@ -338,6 +354,14 @@ class PX4Backend:
         if self._dup(idem):
             return
         self._require_connected()
+        if idem in self._inflight:
+            # D12.1 (rerun C4): the SDK command was already accepted on an
+            # earlier attempt that never confirmed — gimbal aiming is
+            # idempotent by nature, so reconcile (mark done), never re-send.
+            self._done(idem)
+            self._inflight.discard(idem)
+            return
+        self._inflight.add(idem)
         g = self._system.gimbal
         try:
             # MAVSDK v3 signature (gimbal_id, ...); fall back to older v2 shapes.
@@ -353,6 +377,7 @@ class PX4Backend:
             if self.cfg.is_physical:
                 # D12 (review): a physical shoot must never silently lose its
                 # gimbal — fail typed; the executor's failsafe brings it home.
+                self._inflight.discard(idem)  # definite failure: retry may re-send
                 raise CommandRejected(
                     f"gimbal command failed on a physical aircraft: {exc}"
                 ) from exc
@@ -361,6 +386,7 @@ class PX4Backend:
                 "gimbal_unavailable", {"pitch_deg": pitch_deg, "error": str(exc)}
             )
         self._done(idem)
+        self._inflight.discard(idem)
 
     async def capture_photo(self, spec: CaptureSpec, *, idem: str) -> MediaRef:
         if self._dup(idem):
@@ -503,8 +529,10 @@ class PX4Backend:
         self._require_connected()
         try:
             await self._system.action.hold()
-        except Exception:
-            pass  # abort must never raise; executor proceeds to recovery regardless
+        except Exception as exc:
+            # abort must never raise (executor proceeds to recovery regardless)
+            # — but the failure is RECORDED, not swallowed (D12.1 rerun note).
+            self._note_media_event("abort_motion_failed", {"error": str(exc)})
 
     async def fetch_media(self, ref: MediaRef) -> str:
         return ref.path or ""

@@ -231,6 +231,7 @@
   $("plan").onclick = async () => {
     $("plan-status").textContent = "planning…";
     $("plan").disabled = true;
+    lastPlan = null;  // D12.1: a new attempt invalidates the reviewed plan
     try {
       const p = await api("/api/plan", "POST",
         { request_text: $("intent").value || $("intent").placeholder, operator: OPERATOR });
