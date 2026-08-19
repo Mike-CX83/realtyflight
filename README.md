@@ -62,6 +62,10 @@ Gazebo flight → 10 photos → 48-event audit trail — has run live. Current w
 is tracked honestly in [`TODO.md`](TODO.md); research and architecture
 decisions live in [`docs/architecture-research/`](docs/architecture-research/).
 
+## Demo
+
+`./phone_demo.sh` — phone demo in one command (`--fake` for instant, no Docker).
+
 ## One-command demo (no API key, no simulator)
 
 ```bash
