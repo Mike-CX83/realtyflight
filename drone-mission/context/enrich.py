@@ -57,23 +57,28 @@ def _simplify_ring(ring: list[GeoPoint], lat0: float) -> tuple[list[GeoPoint], f
 
 
 def _translate(ring: list[GeoPoint], home: GeoPoint, center: GeoPoint,
-               new_center: GeoPoint) -> tuple[list[GeoPoint], GeoPoint, GeoPoint]:
-    """Move the parcel's exact shape so its centroid sits at new_center —
-    meters-preserving in the local frame (sim flights fly the REAL lot shape)."""
-    lat0, lat1 = center.lat, new_center.lat
-    dn_m = (new_center.lat - center.lat) * M_PER_DEG_LAT
-    de_m = (new_center.lon - center.lon) * _m_per_deg_lon(lat0)
+               new_home: GeoPoint) -> tuple[list[GeoPoint], GeoPoint, GeoPoint]:
+    """Move the parcel's exact shape so its HOME point lands EXACTLY on
+    new_home — meters-preserving in the local frame.
+
+    D13.1 (field finding, Mac agent): the first version anchored the CENTROID
+    at the sim position but kept home at the (shifted) representative point —
+    so PX4's RTL flew to its recorded launch point while the plan's home sat
+    tens of meters away, and the executor's honest arrival evidence failed at
+    ~50 m, twice, at the same step. Anchoring on HOME makes the physical
+    launch/RTL point and plan.home the SAME point; home stays guaranteed
+    inside the (identically shifted) polygon."""
+    lat0, lat1 = home.lat, new_home.lat
 
     def shift(p: GeoPoint) -> GeoPoint:
-        north_m = (p.lat - center.lat) * M_PER_DEG_LAT
-        east_m = (p.lon - center.lon) * _m_per_deg_lon(lat0)
+        north_m = (p.lat - home.lat) * M_PER_DEG_LAT
+        east_m = (p.lon - home.lon) * _m_per_deg_lon(lat0)
         return GeoPoint(
-            lat=new_center.lat + north_m / M_PER_DEG_LAT,
-            lon=new_center.lon + east_m / _m_per_deg_lon(lat1),
+            lat=new_home.lat + north_m / M_PER_DEG_LAT,
+            lon=new_home.lon + east_m / _m_per_deg_lon(lat1),
         )
 
-    _ = (dn_m, de_m)  # provenance callers may want these later
-    return [shift(p) for p in ring], shift(home), new_center
+    return [shift(p) for p in ring], new_home, shift(center)
 
 
 async def propose_property(
@@ -129,7 +134,8 @@ async def propose_property(
     if translate_center is not None:
         ring, home, center = _translate(ring, home, center, translate_center)
         provenance["translated"] = True
-        provenance["sim_center"] = {
+        provenance["home_anchored_to_sim_position"] = True   # D13.1
+        provenance["sim_home"] = {
             "lat": translate_center.lat, "lon": translate_center.lon
         }
 

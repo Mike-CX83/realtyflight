@@ -154,17 +154,23 @@ async def test_proposal_fits_schema_and_home_is_inside():
 
 async def test_translation_moves_the_real_shape_to_the_sim():
     """Sim mode: the REAL parcel shape is flown at the simulator's location —
-    edge lengths preserved within 1%, centroid at the sim point, real coords
-    kept in provenance."""
+    edge lengths preserved within 1%, real coords kept in provenance, and
+    (D13.1, the agent's ~50 m RTL finding) plan.home lands EXACTLY on the sim
+    position: PX4's RTL-to-launch and the plan's home are the same point."""
     prov = _RingProvider(36.155124, -95.989531)
     sim_home = GeoPoint(lat=47.397742, lon=8.545594)     # PX4 SITL Zurich
     prop = await propose_property(
         "175 E 2nd St, Tulsa, OK", provider=prov,
         translate_center=sim_home, geocoder=_census_geocoder,
     )
+    from shapely.geometry import Point
+
+    h = prop.property.home
+    assert abs(h.lat - sim_home.lat) < 1e-9 and abs(h.lon - sim_home.lon) < 1e-9, (
+        "home must be ANCHORED to the sim launch point — RTL returns there"
+    )
     poly = Polygon([(p.lon, p.lat) for p in prop.property.boundary])
-    c = poly.centroid
-    assert abs(c.y - sim_home.lat) < 1e-5 and abs(c.x - sim_home.lon) < 1e-5
+    assert poly.contains(Point(h.lon, h.lat))            # still strictly inside
 
     def edge_m(a: GeoPoint, b: GeoPoint, lat0: float) -> float:
         dn = (a.lat - b.lat) * 111_195.0
