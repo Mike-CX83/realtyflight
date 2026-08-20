@@ -21,6 +21,7 @@ dev = [
     "ruff>=0.5",
     "mypy>=1.10",
     "httpx>=0.27",   # FastAPI TestClient transport for tests/test_server.py
+    "pydantic-evals>=2.0",  # planner eval harness (evals/; versioned with pydantic-ai)
 ]
 camera = [
     "opencv-python>=4.9",  # only needed for PX4Backend camera_mode="rtsp"
@@ -31,7 +32,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["core*", "backends*", "planner*", "server*", "demo*", "context*"]
+include = ["core*", "backends*", "planner*", "server*", "demo*", "context*", "evals*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -29,7 +29,9 @@ Safety-rule build plan: `../docs/architecture-research/11-safety-core-build-plan
 | D10 hardening (external review #1): touchdown-evidence P0, GEO-03 path containment P0, Hold duration, capture accounting, RTSP off-loop + typed failure, per-stream telemetry freshness | ✅ regression-tested |
 | D12 + D12.1 hardening (external review #2 + rerun): **full live gate before EVERY command** (orbit segments, captures, retries), preemptive KILL/HOLD with freeze-only stand-down through an open breaker, preempt-first abort that survives audit-log death, approval bound to its validation report + activation re-gated after preflight, fail-closed PX4 telemetry with future-dated rejection, always-on observed-speed hard cap, in-flight idempotency registry, honest brackets, governance chain in the event log from plan-time, server lifespan abort+disconnect | ✅ regression-tested (60+ pinned findings) |
 | Real camera frames (RTSP): code done + stream-verified; live flight PARKED for the Linux/GPU box (TODO A7) | ⏸ |
-| Next: D13 context enrichment (address → parcel), D14 photogrammetry/3D | ⏳ |
+| `context/` — **address → real parcel (D13)**: US Census geocode + county ArcGIS parcels, home-anchored sim translation, provenance in plan + audit; enrichment widens the LLM's context, never its authority | ✅ live-verified vs Tulsa County |
+| `evals/` — **planner eval harness (D15)**: golden + adversarial request banks, the REAL rule engine as scorer, independent hazard probes, keyless scripted mode in CI; `python -m evals.run --model <id>` benchmarks any PydanticAI model | ✅ built + tested |
+| Next: D13-v2 building-footprint auto-center, D14 photogrammetry/3D | ⏳ |
 
 ## Run the tests
 
@@ -40,7 +42,8 @@ pip install -e ".[dev]"                               # or: uv pip install -e ".
 pytest -q
 ```
 
-Expected: `246 passed, 6 skipped` (the skips are PX4 contract tests awaiting a live SITL —
+Expected: `266 passed, 7 skipped` (the skips are PX4 contract tests awaiting a live SITL, plus
+one live-geocoder test behind `RUN_LIVE_CONTEXT=1` —
 start `docker run --rm -it jonasvautherin/px4-gazebo-headless:1.17.0` and run
 `RUN_PX4_CONTRACT=1 pytest tests/test_backend_contract.py -q` to un-skip them). (A handful of python-statemachine `current_state` deprecation
 warnings are known-cosmetic.) The fun ones are the evil suites across `tests/test_rules_wave*.py` —

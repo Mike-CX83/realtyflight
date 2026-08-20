@@ -53,13 +53,17 @@ circuit breaker, and the evidence-gated executor. Five real integration bugs
 have been caught so far — each by a different deterministic layer, which is
 the architecture working as intended.
 
-## Status (2026-08-15)
+## Status (2026-08-20)
 
-Safety core, executor, LLM planner, PX4 adapter, shot library, and the
-end-to-end demo are built and tested: **180 passed, 6 skipped** (the skips are
-SITL-gated contract tests), lint-clean. A full mission — sentence → approval →
-Gazebo flight → 10 photos → 48-event audit trail — has run live. Current work
-is tracked honestly in [`TODO.md`](TODO.md); research and architecture
+Safety core, executor, LLM planner, PX4 adapter, shot library, phone dashboard,
+address→parcel context, and the end-to-end demo are built and tested:
+**266 passed, 7 skipped** (the skips are SITL- and live-API-gated), lint-clean.
+A full mission — sentence → approval → Gazebo flight → photos → audit trail —
+has run live, including against a real Tulsa County parcel boundary. The
+planner also has a deterministic eval harness (`drone-mission/evals/`): golden
+and adversarial request banks scored by the real rule engine, keyless in CI,
+any PydanticAI model id live. Current work is tracked honestly in
+[`TODO.md`](TODO.md); research and architecture
 decisions live in [`docs/architecture-research/`](docs/architecture-research/).
 
 ## Demo
@@ -93,7 +97,7 @@ progress) carries the full show script.
 ## Repository map
 
 ```
-drone-mission/          the software (core, backends, planner, demo, tests)
+drone-mission/          the software (core, backends, planner, evals, demo, tests)
 docs/architecture-research/   14 research docs: charter → audit → architecture → roadmap
 TODO.md                 the living plan — every milestone, decision, and parked item
 research/               third-party reference repos (read-only, gitignored)
@@ -102,7 +106,8 @@ research/               third-party reference repos (read-only, gitignored)
 ## Tests
 
 ```bash
-cd drone-mission && pytest -q          # 180 passed, 6 skipped
+cd drone-mission && pytest -q          # 266 passed, 7 skipped
+python -m evals.run                    # planner eval harness, keyless (--model <id> for live)
 RUN_PX4_CONTRACT=1 pytest tests/test_backend_contract.py -q   # with a live SITL
 ```
 
