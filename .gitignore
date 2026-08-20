@@ -32,3 +32,6 @@ dist/
 media/
 *.ulg
 *.rrd
+
+# ---- never track bare key files (belt & suspenders; keys live in drone-mission/.env) ----
+*api-key*
