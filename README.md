@@ -4,7 +4,7 @@
 
 RealtyFlight turns a property photography request into an inspectable drone mission. A language model proposes typed steps, deterministic rules check the plan, an operator approves it, and a mission executor runs it through a backend while recording an audit trail.
 
-The project explores AI assisted real estate photography through simulation. It was developed as an Atlas School capstone. The supplied demo paths run with a deterministic fake backend or PX4 software in the loop; they are not a release for unattended physical flight.
+The project explores AI assisted real estate photography through simulation. The supplied demo paths run with a deterministic fake backend or PX4 software in the loop; they are not a release for unattended physical flight.
 
 ## Contents
 
