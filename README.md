@@ -1,119 +1,152 @@
 # RealtyFlight
 
-**A sentence becomes a governed, auditable drone photography mission.**
+## Project Description
 
-Capstone project — Atlas School, Tulsa. An operator types
-*"Photograph this property: orbit the house, full exterior package."* — a
-large-language-model planner proposes a typed mission, deterministic safety
-rules judge it, a human approves it, and a state-machine executor flies it on
-a real autopilot, producing photos and an append-only audit trail that can
-replay the entire flight.
+RealtyFlight turns a property photography request into an inspectable drone mission. A language model proposes typed steps, deterministic rules check the plan, an operator approves it, and a mission executor runs it through a backend while recording an audit trail.
 
-```
-natural language
-      ↓
-LLM planner            — proposes typed steps ONLY; cannot touch limits,
-      ↓                  boundaries, ids, or the aircraft (server-injected)
-deterministic rules    — 15+ validators: sequence, envelope, boundary
-      ↓                  geometry incl. path corridors, live battery/GPS/
-      ↓                  telemetry freshness, backend capability
-human approval         — hash-bound to the exact plan, 300 s TTL; editing
-      ↓                  one meter of altitude voids it
-mission executor       — 13-state machine; a dispatch gate re-checks reality
-      ↓                  before EVERY command; steps advance only on
-      ↓                  telemetry EVIDENCE; abort preempts and flies home
-DroneBackend contract  — the core cannot tell PX4 from Parrot from a test
-      ↓                  fake; that is the portability claim, proven by one
-      ↓                  contract suite run against every backend
-PX4 (MAVSDK) → Gazebo physics simulation
-```
+The project explores AI assisted real estate photography through simulation. It was developed as an Atlas School capstone. The supplied demo paths run with a deterministic fake backend or PX4 software in the loop; they are not a release for unattended physical flight.
 
-## What is real vs. simulated
+## Contents
 
-| Real | Simulated |
-|---|---|
-| PX4 autopilot firmware (the same software that flies physical aircraft) | The aircraft & world (Gazebo physics) |
-| MAVLink/MAVSDK protocol, telemetry, flight modes | GPS constellation, battery model |
-| The LLM planner (verified live against gpt-5.1) | Camera frames on low-power machines (synthetic evidence stubs; real RTSP frames verified, full camera flights pending GPU hardware) |
-| Every safety rule, approval, audit record | — |
+* [Usage](#usage)
+* [Installation](#installation)
+* [How It Works](#how-it-works)
+* [Tech Stack](#tech-stack)
+* [Testing](#testing)
+* [Current Limits](#current-limits)
+* [Author](#author)
 
-**No physical aircraft flies this code yet — by design.** Physical flight sits
-behind explicit gates (simulator-proven behavior, fault drills, a Part
-107-certificated remote pilot in command, and a typed real-flight
-confirmation). The `sim`/`real` profile wall is enforced in code: a simulation
-configuration can never command a physical aircraft.
+## Usage
 
-## The safety boundary
+A typical request is:
 
-The LLM **proposes**; it never controls. Its output is parsed into a closed,
-typed vocabulary (unknown actions and fields are parse failures). Everything
-that decides whether the aircraft moves is deterministic code Mike can point
-to: the rule engine, the hash-bound approval, the pre-dispatch gate, the
-circuit breaker, and the evidence-gated executor. Five real integration bugs
-have been caught so far — each by a different deterministic layer, which is
-the architecture working as intended.
+> Photograph this property: orbit the house and capture the exterior, then return home.
 
-## Status (2026-08-20)
+The dashboard presents the proposed steps and validation results. The operator approves the exact plan and can monitor telemetry, hold or abort a mission, and inspect recorded events afterward.
 
-Safety core, executor, LLM planner, PX4 adapter, shot library, phone dashboard,
-address→parcel context, and the end-to-end demo are built and tested:
-**266 passed, 7 skipped** (the skips are SITL- and live-API-gated), lint-clean.
-A full mission — sentence → approval → Gazebo flight → photos → audit trail —
-has run live, including against a real Tulsa County parcel boundary. The
-planner also has a deterministic eval harness (`drone-mission/evals/`): golden
-and adversarial request banks scored by the real rule engine, keyless in CI,
-any PydanticAI model id live. Current work is tracked honestly in
-[`TODO.md`](TODO.md); research and architecture
-decisions live in [`docs/architecture-research/`](docs/architecture-research/).
+For a first look, use the scripted fake demo below. It requires no model credentials, simulator, or physical drone. Its planner is deterministic, so it demonstrates the workflow rather than unrestricted natural language understanding.
 
-## Demo
+## Installation
 
-`./phone_demo.sh` — phone demo in one command (`--fake` for instant, no Docker).
+### Prerequisites
 
-## One-command demo (no API key, no simulator)
+* Git and Python 3.11 or newer.
+* A Python virtual environment.
+* Optional Docker and PX4/Gazebo for the simulator backend.
+* Optional model provider credentials and matching PydanticAI provider extras for live language model planning.
 
 ```bash
-cd drone-mission
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-python -m demo.fly --backend fake --model scripted --auto-approve
+git clone https://github.com/Mike-CX83/realtyflight.git
+cd realtyflight/drone-mission
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
 ```
 
-## The real thing (LLM + physics + watchable map)
+On Windows, activate the environment with the appropriate `.venv\Scripts` activation command.
+
+### Scripted command line demo
+
+From `drone-mission`:
 
 ```bash
-# terminal 1 — the drone (PX4 + Gazebo, headless):
+python -m demo.fly --backend fake --model scripted
+```
+
+Review the printed plan and rule checks. Type `APPROVE` when prompted to authorize the simulated mission. The command prints its result and audit events, stored by default in `runs/mission_events.sqlite3`.
+
+### Local dashboard
+
+From the same folder and activated environment:
+
+```bash
+DASH_HOST=127.0.0.1 DASH_BACKEND=fake DASH_MODEL=scripted python -m server
+```
+
+Open `http://127.0.0.1:8000`. Enter the token printed in the terminal and an operator name. Plan a mission, review the checks, and approve it through the interface.
+
+This example binds to the local computer. The repository's `phone_demo.sh` helper is a separate LAN demonstration that can start Docker, create a simulator container, and print connection details.
+
+### Optional PX4 simulation
+
+Start the simulator in one terminal:
+
+```bash
 docker run --rm -it jonasvautherin/px4-gazebo-headless:1.17.0
-
-# terminal 2 — the mission (put ANTHROPIC_API_KEY or OPENAI_API_KEY in drone-mission/.env):
-cd drone-mission && source .venv/bin/activate
-python -m demo.fly "Photograph this property: the full exterior package." --backend px4
 ```
 
-Open QGroundControl alongside and watch the mission fly on a live map; press
-Ctrl+C mid-orbit to watch the abort path bring it home. `docs/DEMO.md` (in
-progress) carries the full show script.
-
-## Repository map
-
-```
-drone-mission/          the software (core, backends, planner, evals, demo, tests)
-docs/architecture-research/   14 research docs: charter → audit → architecture → roadmap
-TODO.md                 the living plan — every milestone, decision, and parked item
-research/               third-party reference repos (read-only, gitignored)
-```
-
-## Tests
+Then, from the activated application environment:
 
 ```bash
-cd drone-mission && pytest -q          # 266 passed, 7 skipped
-python -m evals.run                    # planner eval harness, keyless (--model <id> for live)
-RUN_PX4_CONTRACT=1 pytest tests/test_backend_contract.py -q   # with a live SITL
+python -m demo.fly --backend px4 --model scripted
 ```
 
-CI runs the suite + ruff on every push (`.github/workflows/ci.yml`).
+This uses the same planning and approval flow with PX4 telemetry and a simulated aircraft. Model planning can be enabled separately by selecting a supported PydanticAI model and configuring its provider. Keep keys in the ignored local environment, not in the README or Git.
+
+## How It Works
+
+1. **Planning:** the planner proposes steps and a summary. The application supplies the property, limits, and other governed fields.
+2. **Validation:** typed schemas and policy rules check sequencing, geometry, motion limits, telemetry, and backend capabilities.
+3. **Approval:** authorization is tied to the exact plan hash and has a limited lifetime.
+4. **Execution:** a state machine checks dispatch conditions and uses telemetry evidence to advance steps.
+5. **Audit:** SQLite events record the plan, approval, commands, state changes, and outcomes for replay.
+
+Abort requests recovery toward home and landing; the kill circuit breaker instead freezes ordinary command dispatch. Recovery paths have their own bounded handling rather than rerunning every normal plan rule.
+
+The `DroneBackend` interface separates the mission logic from the fake and PX4/MAVSDK implementations. The core does not import a drone SDK.
+
+The code also contains a photography shot library, address and parcel context helpers, planner evaluation cases, and a static mission replay showcase.
+
+## Tech Stack
+
+* Python and Pydantic for models and validation.
+* PydanticAI for structured mission proposals.
+* Shapely and pymap3d for geometry.
+* python-statemachine for execution states.
+* MAVSDK with PX4/Gazebo for simulation.
+* FastAPI, Uvicorn, and WebSockets for the dashboard.
+* SQLite for mission event history.
+* pytest, pytest-asyncio, and Ruff for checks.
+
+## Testing
+
+From `drone-mission`:
+
+```bash
+ruff check .
+pytest -q
+python -m evals.run --model scripted
+```
+
+The tests cover schema validation, policy rules, approvals, executor behavior, backend contracts, planner behavior, context, and dashboard routes. The scripted evaluation uses the rule engine to assess normal and adversarial cases.
+
+Tests that require a running simulator or live external service are separately enabled. Existing test counts in older project notes are historical; this README update did not rerun the application suite or fly a mission.
+
+## Current Limits
+
+* The code includes fake and PX4 backends; a Parrot adapter is not included.
+* PX4 demo camera output is synthetic by default. RTSP capture needs the camera extra, a compatible stream, and the matching simulator configuration.
+* Address lookups depend on external data. Parcel lookup requires a configured county service.
+* Simulator behavior and software controls do not establish physical flight readiness or regulatory approval.
+
+## Project Files
+
+* `drone-mission/core/`: schemas, policy, approvals, execution, and audit.
+* `drone-mission/backends/`: fake and PX4 implementations.
+* `drone-mission/planner/`: mission planning and shot library.
+* `drone-mission/server/`: dashboard API and interface.
+* `drone-mission/evals/`: planner evaluation harness.
+* `showcase/index.html`: static replay presentation.
+* [Architecture research](docs/architecture-research/08-target-system-architecture.md).
+* [Development roadmap](TODO.md).
+* [Historical README checkpoint](docs/README_CHECKPOINT_2026_11_16.md).
+
+## Author
+
+**Mike Hankins**, software engineering and systems design student at Atlas School and founder of CX83 Labs.
+
+[GitHub](https://github.com/Mike-CX83)
 
 ## License
 
-MIT (see [LICENSE](LICENSE)). Third-party reference repositories under
-`research/` keep their own licenses and are never redistributed here.
+[MIT License](LICENSE). Third party tools and dependencies retain their respective licenses.
